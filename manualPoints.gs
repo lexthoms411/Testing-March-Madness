@@ -87,13 +87,35 @@ function handleFormGradeOverride() {
     const formResponsesSheet = sheet.getSheetByName(SHEETS.FORM_RESPONSES);
     const scoresSheet = sheet.getSheetByName(SHEETS.SCORES);
     
-    if (!formResponsesSheet || !scoresSheet) {
+    // Get or create processing log sheet
+    let processingLogSheet = sheet.getSheetByName("Manual Grade Processing Log");
+    if (!processingLogSheet) {
+        processingLogSheet = sheet.insertSheet("Manual Grade Processing Log");
+        processingLogSheet.appendRow(["Timestamp", "Mnemonic", "Score", "Processing Date", "Status"]);
+        processingLogSheet.setFrozenRows(1);
+    }
+    
+    if (!formResponsesSheet || !scoresSheet || !processingLogSheet) {
         logError('Grade Override', 'Required sheets not found');
         return;
     }
 
+    // Get processed entries from log sheet
+    const processedLog = processingLogSheet.getDataRange().getValues();
+    const processedEntries = new Set();
+    
+    // Skip header row
+    for (let i = 1; i < processedLog.length; i++) {
+        if (processedLog[i][0] && processedLog[i][1]) {
+            const key = `${processedLog[i][0]}_${processedLog[i][1].toLowerCase()}`;
+            processedEntries.add(key);
+        }
+    }
+
     const responses = formResponsesSheet.getDataRange().getValues();
     const headers = responses[0];
+    const newProcessedEntries = [];
+    let processedCount = 0;
     
     // Process each response
     for (let i = 1; i < responses.length; i++) {
@@ -102,7 +124,15 @@ function handleFormGradeOverride() {
         const score = row[1];  // Score column B
         const mnemonic = row[2];  // Mnemonic in column C
         
-        if (!score || !mnemonic) continue;
+        if (!timestamp || !score || !mnemonic) continue;
+        
+        // Create a unique key
+        const key = `${timestamp}_${mnemonic.toLowerCase()}`;
+        
+        if (processedEntries.has(key)) {
+            console.log(`Skipping already processed grade for ${mnemonic}`);
+            continue;
+        }
         
         // Parse the score fraction (e.g., "4/4" -> 4)
         let points = 0;
@@ -114,7 +144,7 @@ function handleFormGradeOverride() {
         }
 
         if (points > 0) {
-            // Use first question ID as reference since this is manual grading
+            // Use consistent question ID format for manual grades
             const questionId = 'MANUAL_GRADE';
             
             addManualPoints(
@@ -123,7 +153,32 @@ function handleFormGradeOverride() {
                 points, 
                 `Manual grade from form response: ${score} points`
             );
+            
+            // Add to log of processed entries
+            newProcessedEntries.push([
+                timestamp,
+                mnemonic,
+                score,
+                new Date(),
+                "Processed"
+            ]);
+            
+            processedCount++;
         }
+    }
+    
+    // Batch append new processed entries to log
+    if (newProcessedEntries.length > 0) {
+        processingLogSheet.getRange(
+            processingLogSheet.getLastRow() + 1, 
+            1, 
+            newProcessedEntries.length, 
+            newProcessedEntries[0].length
+        ).setValues(newProcessedEntries);
+        
+        console.log(`Successfully processed ${processedCount} new manual grades`);
+    } else {
+        console.log("No new manual grades to process");
     }
 }
 
