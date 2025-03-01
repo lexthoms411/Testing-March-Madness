@@ -1,0 +1,210 @@
+/**
+ * Add manual points to a user
+ */
+function addManualPoints(mnemonic, questionId, points, reason) {
+    const sheet = SpreadsheetApp.getActiveSpreadsheet();
+    const scoresSheet = sheet.getSheetByName(SHEETS.SCORES);
+    const auditLogSheet = sheet.getSheetByName(SHEETS.AUDIT_LOG);
+
+    if (!scoresSheet || !auditLogSheet) {
+        logError('Manual Points', 'Required sheets not found');
+        return false;
+    }
+
+    try {
+        // Get current score and row index
+        let currentScore = 0;
+        let userRow = -1;
+        const scoresData = scoresSheet.getDataRange().getValues();
+        
+        for (let i = 1; i < scoresData.length; i++) {
+            if (scoresData[i][0]?.toLowerCase() === mnemonic.toLowerCase()) {
+                currentScore = Number(scoresData[i][3]) || 0;
+                userRow = i + 1;  // +1 because array index starts at 0 but sheet rows start at 1
+                break;
+            }
+        }
+
+        if (userRow === -1) {
+            throw new Error(`User ${mnemonic} not found in scores sheet`);
+        }
+
+        // Calculate new score
+        const newScore = currentScore + points;
+
+        // Update score in Scores sheet
+        scoresSheet.getRange(userRow, 4).setValue(newScore);  // Column D (4) is the total score
+
+        // Update attempts in Scores sheet
+        let attempts = {};
+        try {
+            const existingAttempts = scoresSheet.getRange(userRow, 6).getValue();
+            attempts = JSON.parse(existingAttempts || "{}");
+        } catch (e) {
+            console.error('Error parsing existing attempts:', e);
+        }
+
+        attempts[questionId] = {
+            timestamp: new Date(),
+            points: points,
+            manual: true
+        };
+
+        scoresSheet.getRange(userRow, 6).setValue(JSON.stringify(attempts));
+
+        // Log to audit
+        const auditEntry = [
+            new Date(),           // Timestamp
+            mnemonic,            // Mnemonic
+            questionId,          // Question ID
+            reason,              // Answer/Reason
+            'Manual',            // Correct?
+            'No',               // Duplicate?
+            'Yes',              // Correct Role?
+            currentScore,        // Previous Points
+            points,             // Earned Points
+            newScore,           // Total Points
+            'Manual Addition'    // Status
+        ];
+        
+        auditLogSheet.appendRow(auditEntry);
+        
+        // Update leaderboard
+        updateLeaderboard();
+        
+        return true;
+    } catch (error) {
+        logError('Manual Points', `Error adding points for ${mnemonic}: ${error.message}`);
+        return false;
+    }
+}
+
+/**
+ * Handle form grading override from Form Responses
+ */
+function handleFormGradeOverride() {
+    const sheet = SpreadsheetApp.getActiveSpreadsheet();
+    const formResponsesSheet = sheet.getSheetByName(SHEETS.FORM_RESPONSES);
+    const scoresSheet = sheet.getSheetByName(SHEETS.SCORES);
+    
+    if (!formResponsesSheet || !scoresSheet) {
+        logError('Grade Override', 'Required sheets not found');
+        return;
+    }
+
+    const responses = formResponsesSheet.getDataRange().getValues();
+    const headers = responses[0];
+    
+    // Process each response
+    for (let i = 1; i < responses.length; i++) {
+        const row = responses[i];
+        const timestamp = row[0];
+        const score = row[1];  // Score column B
+        const mnemonic = row[2];  // Mnemonic in column C
+        
+        if (!score || !mnemonic) continue;
+        
+        // Parse the score fraction (e.g., "4/4" -> 4)
+        let points = 0;
+        if (typeof score === 'string' && score.includes('/')) {
+            const [earned, total] = score.split('/').map(Number);
+            points = earned;
+        } else if (!isNaN(score)) {
+            points = Number(score);
+        }
+
+        if (points > 0) {
+            // Use first question ID as reference since this is manual grading
+            const questionId = 'MANUAL_GRADE';
+            
+            addManualPoints(
+                mnemonic, 
+                questionId, 
+                points, 
+                `Manual grade from form response: ${score} points`
+            );
+        }
+    }
+}
+
+/**
+ * Show dialog for adding manual points
+ */
+function showManualPointsDialog() {
+  const html = HtmlService.createHtmlOutput(`
+    <form id="manualPointsForm">
+      <div style="margin-bottom: 10px;">
+        <label for="mnemonic">Mnemonic:</label><br>
+        <input type="text" id="mnemonic" required style="width: 100%;">
+      </div>
+      <div style="margin-bottom: 10px;">
+        <label for="type">Point Type:</label><br>
+        <select id="type" onchange="toggleQuestionId()" style="width: 100%;">
+          <option value="question">Question Points</option>
+          <option value="bonus">Bonus/Recognition Points</option>
+        </select>
+      </div>
+      <div id="questionIdField" style="margin-bottom: 10px;">
+        <label for="questionId">Question ID:</label><br>
+        <input type="text" id="questionId" style="width: 100%;">
+      </div>
+      <div style="margin-bottom: 10px;">
+        <label for="points">Points:</label><br>
+        <input type="number" id="points" required style="width: 100%;">
+      </div>
+      <div style="margin-bottom: 10px;">
+        <label for="reason">Reason:</label><br>
+        <textarea id="reason" required style="width: 100%; height: 60px;" 
+          placeholder="Enter reason for points (e.g., 'STAR recognition', 'Extra effort on case study', etc.)"></textarea>
+      </div>
+      <button onclick="submitForm()" style="width: 100%; padding: 8px;">Add Points</button>
+    </form>
+    <script>
+      function toggleQuestionId() {
+        const type = document.getElementById('type').value;
+        const questionField = document.getElementById('questionIdField');
+        const questionId = document.getElementById('questionId');
+        
+        if (type === 'bonus') {
+          questionField.style.display = 'none';
+          questionId.required = false;
+          questionId.value = 'BONUS';
+        } else {
+          questionField.style.display = 'block';
+          questionId.required = true;
+        }
+      }
+      
+      function submitForm() {
+        const form = document.getElementById('manualPointsForm');
+        const data = {
+          mnemonic: document.getElementById('mnemonic').value,
+          questionId: document.getElementById('questionId').value || 'BONUS',
+          points: Number(document.getElementById('points').value),
+          reason: document.getElementById('reason').value,
+          type: document.getElementById('type').value
+        };
+        
+        if (!data.questionId && data.type === 'question') {
+          alert('Please enter a Question ID for question points');
+          return;
+        }
+        
+        google.script.run
+          .withSuccessHandler(() => {
+            alert('Points added successfully!');
+            google.script.host.close();
+          })
+          .withFailureHandler((error) => {
+            alert('Error adding points: ' + error);
+          })
+          .addManualPoints(data.mnemonic, data.questionId, data.points, data.reason);
+      }
+    </script>
+  `)
+    .setWidth(400)
+    .setHeight(350)
+    .setTitle('Add Manual Points');
+  
+  SpreadsheetApp.getUi().showModalDialog(html, 'Add Manual Points');
+}
