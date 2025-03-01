@@ -227,17 +227,6 @@ function moveItemToSection(form, item, section) {
   }
 }
 
-function createDailyTrigger() {
-  ScriptApp.getProjectTriggers().forEach(trigger => ScriptApp.deleteTrigger(trigger));
-  
-  ScriptApp.newTrigger('updateDailyQuestions')
-      .timeBased()
-      .atHour(0)
-      .everyDays(1)
-      .create();
-      
-  logToSheet('Trigger Setup', 'SUCCESS', 'Daily trigger created');
-}
 
 
 
