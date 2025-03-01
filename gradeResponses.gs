@@ -1,5 +1,5 @@
 /**
- * Main grading function with enhanced performance optimizations
+ * Main grading function with enhanced error handling
  */
 function gradeResponses() {
     // Use lock service to prevent concurrent execution
@@ -24,41 +24,49 @@ function gradeResponses() {
             logError('Grade Responses', 'Missing required sheets');
             return;
         }
+        
+        // Check if audit log sheet has header
+        if (auditLogSheet.getLastRow() === 0) {
+            console.log("Initializing Audit Log sheet with header row");
+            auditLogSheet.appendRow([
+                "Timestamp", "Mnemonic", "Question ID", "Answer", "Correct?", 
+                "Duplicate?", "Correct Role?", "Previous Points", "Earned Points", 
+                "Total Points", "Status"
+            ]);
+        }
 
-        // Get valid mnemonics with caching (do this first since it's a small set)
+        // Get valid mnemonics with caching
         const validMnemonics = getValidMnemonicsWithCache(scoresSheet);
         
-        // OPTIMIZATION: Only fetch the range of ungraded responses
-        // This avoids loading the entire dataset unnecessarily
-        const responsesRange = responsesSheet.getDataRange();
-        const responsesData = responsesRange.getValues();
+        // Check if raw responses sheet has any data
+        const lastRow = responsesSheet.getLastRow();
+        if (lastRow <= 1) {
+            console.info("✅ No responses to process");
+            return;
+        }
         
         // Get already processed responses with caching
         const processedResponses = getProcessedResponsesWithCache(auditLogSheet);
 
-        // Get question data with caching for later use
+        // Get question data with caching
         const questionMap = getQuestionMapWithCache(questionBankSheet);
         const answerMapping = getAnswerMappingWithCache(questionMap);
         
-        // Pre-screen for ungraded responses with valid mnemonics
-        // This creates a more targeted dataset to work with
-        const ungradedResponses = getUngradedResponsesOptimized(responsesData, validMnemonics);
+        // Get ungraded responses
+        const ungradedResponses = getUngradedResponses(responsesSheet, validMnemonics);
         
         if (ungradedResponses.length === 0) {
             console.info("✅ No ungraded responses to process");
-            lock.releaseLock();
             return;
         }
         
         console.info(`🔍 Processing ${ungradedResponses.length} ungraded responses`);
 
-        // OPTIMIZATION: Use batch operations for audit log entries
         let auditLogEntries = [];
         const MAX_EXECUTION_TIME = 250000; // 250 seconds (under 300s limit)
-        const BATCH_SIZE = 25; // Process responses in batches to avoid memory issues
 
-        // Process responses in batches
-        for (let batchStart = 0; batchStart < ungradedResponses.length; batchStart += BATCH_SIZE) {
+        // Process responses
+        for (let i = 0; i < ungradedResponses.length; i++) {
             // Check if we're approaching execution time limit
             if (new Date().getTime() - startTime > MAX_EXECUTION_TIME) {
                 console.warn("⚠️ Approaching execution time limit, saving progress");
@@ -69,14 +77,7 @@ function gradeResponses() {
                     auditLogEntries = [];
                 }
                 
-                // Schedule continuation with state information
-                const state = {
-                    batchStart: batchStart,
-                    totalResponses: ungradedResponses.length
-                };
-                
-                PropertiesService.getScriptProperties().setProperty('continueGradingState', JSON.stringify(state));
-                
+                // Schedule continuation
                 ScriptApp.newTrigger('continueGrading')
                     .timeBased()
                     .after(1000) // 1 second
@@ -85,121 +86,95 @@ function gradeResponses() {
                 return;
             }
             
-            // Process current batch
-            const batchEnd = Math.min(batchStart + BATCH_SIZE, ungradedResponses.length);
-            const currentBatch = ungradedResponses.slice(batchStart, batchEnd);
+            const [rowIndex, row] = ungradedResponses[i];
+            const timestamp = row[0];
+            const mnemonic = row[1]?.toLowerCase();
+            const answerData = parseAnswer(row[2]);
             
-            // OPTIMIZATION: Prepare batch updates for all responses in this batch
-            const gradedStatusUpdates = [];
-            const correctnessUpdates = [];
-            
-            for (const [rowIndex, row] of currentBatch) {
-                const timestamp = row[0];
-                const mnemonic = row[1]?.toLowerCase();
-                const answerData = parseAnswer(row[2]);
-                
-                if (!mnemonic || !answerData) continue;
+            if (!mnemonic || !answerData) continue;
 
-                let anyProcessed = false;
-                for (const [qID, userAnswer] of Object.entries(answerData)) {
-                    const responseKey = `${timestamp}_${mnemonic}_${qID}`.toLowerCase();
+            for (const [qID, userAnswer] of Object.entries(answerData)) {
+                const responseKey = `${timestamp}_${mnemonic}_${qID}`.toLowerCase();
 
-                    if (processedResponses.has(responseKey)) {
-                        continue;
-                    }
-
-                    const questionData = questionMap[qID];
-                    if (!questionData) {
-                        console.warn(`Question ${qID} not found in bank`);
-                        logError('Grade Response', `Question ${qID} not found in bank`);
-                        continue;
-                    }
-
-                    // Get current score before grading
-                    const currentScore = getCurrentScore(scoresSheet, mnemonic);
-
-                    // Get actual role from the Scores sheet
-                    const actualRole = getUserRole(scoresSheet, mnemonic).trim().toLowerCase();
-                    const requiredRole = (questionData.targetRole || "").trim().toLowerCase();
-
-                    // Check both role mismatch & duplicate attempt at the same time
-                    const correctRole = actualRole === requiredRole || !requiredRole;
-                    const isDuplicate = hasAttemptedBefore(scoresSheet, mnemonic, qID);
-
-                    // Grade answer regardless of eligibility
-                    const isCorrect = isAnswerCorrect(userAnswer, questionData.correctAnswer, questionData.type);
-                    let earnedPoints = 0;
-
-                    // Only award points if eligible (correct role and not duplicate)
-                    if (correctRole && !isDuplicate) {
-                        if (questionData.type && questionData.type.toLowerCase() === "multiple select") {
-                            earnedPoints = calculatePartialCredit(
-                                userAnswer,
-                                questionData.correctAnswer,
-                                questionData.type,
-                                questionData.points
-                            );
-                        } else {
-                            earnedPoints = isCorrect ? questionData.points : 0;
-                        }
-
-                        // Update scores
-                        updateScores(scoresSheet, mnemonic, qID, earnedPoints, timestamp);
-                    }
-
-                    // Add to batch updates for correctness status
-                    correctnessUpdates.push({
-                        rowIndex: rowIndex + 1,
-                        value: isCorrect ? "Correct" : "Incorrect"
-                    });
-
-                    // Get shortened answers for display
-                    let formattedUserAnswer = getAnswerLetters(userAnswer, qID, answerMapping);
-                    let formattedCorrectAnswer = getAnswerLetters(questionData.correctAnswer, qID, answerMapping);
-                    
-                    // Short display version for audit log
-                    const answerDisplay = `Answer: ${shortenAnswerText(formattedUserAnswer)} (Expected: ${shortenAnswerText(formattedCorrectAnswer)})`;
-
-                    // Log to audit with new column structure
-                    auditLogEntries.push([
-                        timestamp,                    // Timestamp
-                        mnemonic,                    // Mnemonic
-                        qID,                         // Question ID
-                        answerDisplay,               // Shortened answer
-                        isCorrect ? "Correct" : "Incorrect",  // Correct? (now shows regardless of status)
-                        isDuplicate ? "Yes" : "No",  // Duplicate Attempt?
-                        correctRole ? "Yes" : "No",  // Correct Role?
-                        currentScore,                // Previous Points
-                        earnedPoints,                // Earned Points
-                        currentScore + earnedPoints, // Total Points
-                        isDuplicate ? "Duplicate" :
-                            !correctRole ? "Role Mismatch" :
-                            "Processed"              // Status
-                    ]);
-                    
-                    anyProcessed = true;
-                    processedResponses.add(responseKey);
+                if (processedResponses.has(responseKey)) {
+                    continue;
                 }
+
+                const questionData = questionMap[qID];
+                if (!questionData) {
+                    console.warn(`Question ${qID} not found in bank`);
+                    logError('Grade Response', `Question ${qID} not found in bank`);
+                    continue;
+                }
+
+                // Get current score before grading
+                const currentScore = getCurrentScore(scoresSheet, mnemonic);
+
+                // Get actual role from the Scores sheet
+                const actualRole = getUserRole(scoresSheet, mnemonic).trim().toLowerCase();
+                const requiredRole = (questionData.targetRole || "").trim().toLowerCase();
+
+                // Check both role mismatch & duplicate attempt at the same time
+                const correctRole = actualRole === requiredRole || !requiredRole;
+                const isDuplicate = hasAttemptedBefore(scoresSheet, mnemonic, qID);
+
+                // Grade answer regardless of eligibility
+                const isCorrect = isAnswerCorrect(userAnswer, questionData.correctAnswer, questionData.type);
+                let earnedPoints = 0;
+
+                // Only award points if eligible (correct role and not duplicate)
+                if (correctRole && !isDuplicate) {
+                    if (questionData.type && questionData.type.toLowerCase() === "multiple select") {
+                        earnedPoints = calculatePartialCredit(
+                            userAnswer,
+                            questionData.correctAnswer,
+                            questionData.type,
+                            questionData.points
+                        );
+                    } else {
+                        earnedPoints = isCorrect ? questionData.points : 0;
+                    }
+
+                    // Update scores
+                    updateScores(scoresSheet, mnemonic, qID, earnedPoints, timestamp);
+                }
+
+                // Update raw responses with correct/incorrect status
+                responsesSheet.getRange(rowIndex + 1, 6).setValue(isCorrect ? "Correct" : "Incorrect");
+
+                // Get shortened answers for display
+                let formattedUserAnswer = getAnswerLetters(userAnswer, qID, answerMapping);
+                let formattedCorrectAnswer = getAnswerLetters(questionData.correctAnswer, qID, answerMapping);
                 
-                // Mark as graded if we processed anything
-                if (anyProcessed) {
-                    gradedStatusUpdates.push({
-                        rowIndex: rowIndex + 1,
-                        value: "Yes"
-                    });
+                // Short display version for audit log
+                const answerDisplay = `Answer: ${shortenAnswerText(formattedUserAnswer)} (Expected: ${shortenAnswerText(formattedCorrectAnswer)})`;
+
+                // Log to audit with new column structure
+                auditLogEntries.push([
+                    timestamp,                    // Timestamp
+                    mnemonic,                    // Mnemonic
+                    qID,                         // Question ID
+                    answerDisplay,               // Shortened answer
+                    isCorrect ? "Correct" : "Incorrect",  // Correct? (now shows regardless of status)
+                    isDuplicate ? "Yes" : "No",  // Duplicate Attempt?
+                    correctRole ? "Yes" : "No",  // Correct Role?
+                    currentScore,                // Previous Points
+                    earnedPoints,                // Earned Points
+                    currentScore + earnedPoints, // Total Points
+                    isDuplicate ? "Duplicate" :
+                        !correctRole ? "Role Mismatch" :
+                        "Processed"              // Status
+                ]);
+                
+                // Process in smaller batches to avoid memory issues
+                if (auditLogEntries.length >= 50) {
+                    appendToAuditLog(auditLogSheet, auditLogEntries);
+                    auditLogEntries = [];
                 }
             }
-            
-            // OPTIMIZATION: Apply batch updates
-            // We do this in batches of 50 to avoid hitting API limits
-            applyBatchUpdates(responsesSheet, gradedStatusUpdates, 5); // Column E (5) is graded status
-            applyBatchUpdates(responsesSheet, correctnessUpdates, 6);   // Column F (6) is correctness
-            
-            // Process audit log in smaller batches to avoid memory issues
-            if (auditLogEntries.length >= 50) {
-                appendToAuditLog(auditLogSheet, auditLogEntries);
-                auditLogEntries = [];
-            }
+
+            // Mark as graded
+            responsesSheet.getRange(rowIndex + 1, 5).setValue("Yes");
         }
 
         // Add any remaining audit entries
@@ -216,7 +191,8 @@ function gradeResponses() {
         // Update Processed Responses
         updateProcessedResponses();
 
-        console.info(`🎉 Grading complete! Total execution time: ${(new Date().getTime() - startTime)/1000} seconds`);
+        const executionTime = (new Date().getTime() - startTime) / 1000;
+        console.info(`🎉 Grading complete! Execution time: ${executionTime} seconds`);
     } catch (e) {
         console.error("❌ Error in grading process:", e.message, e.stack);
         logError('Grade Responses', `Error in grading process: ${e.message}\n${e.stack}`);
@@ -511,7 +487,7 @@ function appendToAuditLog(auditLogSheet, entries) {
 }
 
 /**
- * Get processed responses with caching - optimized version
+ * Get processed responses with caching - optimized version with empty sheet handling
  */
 function getProcessedResponsesWithCache(auditLogSheet) {
     const cache = CacheService.getScriptCache();
@@ -531,40 +507,28 @@ function getProcessedResponsesWithCache(auditLogSheet) {
     // If not in cache or parse error, rebuild more efficiently
     const processedResponses = new Set();
     
-    // Get only the columns we need (timestamp, mnemonic, questionId) instead of the entire range
-    const auditData = auditLogSheet.getRange(2, 1, auditLogSheet.getLastRow() - 1, 3).getValues();
-
-    for (const row of auditData) {
-        if (row[0] && row[1] && row[2]) {
-            const key = `${row[0]}_${String(row[1]).toLowerCase()}_${row[2]}`;
-            processedResponses.add(key);
-        }
-    }
+    // Check if sheet has data beyond the header row
+    const lastRow = auditLogSheet.getLastRow();
     
-    // OPTIMIZATION: Split into chunks if too large for cache
-    const responseArray = Array.from(processedResponses);
-    if (responseArray.length > 0) {
-        try {
-            if (responseArray.length < 5000) {
-                // Store in cache for 6 hours if not too large
-                cache.put(cacheKey, JSON.stringify(responseArray), 21600);
-            } else {
-                // Split into chunks
-                const CHUNK_SIZE = 4000;
-                for (let i = 0; i < responseArray.length; i += CHUNK_SIZE) {
-                    const chunk = responseArray.slice(i, i + CHUNK_SIZE);
-                    cache.put(`${cacheKey}_chunk_${i/CHUNK_SIZE}`, JSON.stringify(chunk), 21600);
-                }
-                
-                // Store the metadata about chunks
-                cache.put(`${cacheKey}_meta`, JSON.stringify({
-                    chunks: Math.ceil(responseArray.length / CHUNK_SIZE),
-                    totalItems: responseArray.length
-                }), 21600);
+    if (lastRow > 1) {
+        // Get only the columns we need (timestamp, mnemonic, questionId)
+        const auditData = auditLogSheet.getRange(2, 1, lastRow - 1, 3).getValues();
+
+        for (const row of auditData) {
+            if (row[0] && row[1] && row[2]) {
+                const key = `${row[0]}_${String(row[1]).toLowerCase()}_${row[2]}`;
+                processedResponses.add(key);
             }
+        }
+        
+        // Store in cache for future use
+        try {
+            cache.put(cacheKey, JSON.stringify(Array.from(processedResponses)), 21600);
         } catch (e) {
             console.warn("⚠️ Error storing cache:", e.message);
         }
+    } else {
+        console.log("Audit log is empty (only header row) - no processed responses to load");
     }
 
     return processedResponses;
@@ -1233,51 +1197,108 @@ function onFormSubmit(e) {
     }
 }
 
+
 /**
- * Process the queue of submissions (runs every 5 minutes)
+ * Process the queue of submissions
  */
 function processQueue() {
-    const sheet = SpreadsheetApp.getActiveSpreadsheet();
-    const queueSheet = sheet.getSheetByName("Processing Queue");
-    
-    if (!queueSheet) {
-        // Create the sheet if it doesn't exist
-        const newSheet = sheet.insertSheet("Processing Queue");
-        newSheet.appendRow(["Timestamp", "Mnemonic", "Processed", "Processing Timestamp"]);
-        console.log("Created new Processing Queue sheet");
-        return;
-    }
-    
-    const queueData = queueSheet.getDataRange().getValues();
-    if (queueData.length <= 1) {
-        console.log("No items in queue to process");
-        return;
-    }
-    
-    // Find all pending indices
-    const pendingIndices = [];
-    for (let i = 1; i < queueData.length; i++) {
-        if (queueData[i][2] === "No") {
-            pendingIndices.push(i);
+    // Use lock service to prevent concurrent execution
+    const lock = LockService.getScriptLock();
+    try {
+        if (!lock.tryLock(10000)) { // 10 seconds timeout
+            console.log("Could not obtain lock for processing queue. Another process is running.");
+            return;
+        }
+        
+        console.log("🔄 Processing submission queue...");
+        
+        // First make sure responses are synced from the form
+        syncResponses();
+        
+        // Now run the main grading function to handle all ungraded responses
+        try {
+            gradeResponses();
+        } catch (e) {
+            console.error("Error running gradeResponses:", e.message);
+        }
+        
+        // Process any items in the queue sheet
+        const sheet = SpreadsheetApp.getActiveSpreadsheet();
+        const queueSheet = sheet.getSheetByName("Processing Queue");
+        
+        if (!queueSheet) {
+            console.log("ℹ️ No queue sheet found - nothing to process");
+            return;
+        }
+        
+        // Check if queue sheet has data
+        if (queueSheet.getLastRow() <= 1) {
+            console.log("ℹ️ No items in queue to process");
+            return;
+        }
+        
+        const queueData = queueSheet.getDataRange().getValues();
+        
+        // Count how many we need to process
+        let pendingCount = 0;
+        const pendingIndices = [];
+        
+        for (let i = 1; i < queueData.length; i++) {
+            if (queueData[i][2] === "No") {
+                pendingCount++;
+                pendingIndices.push(i);
+            }
+        }
+        
+        if (pendingCount === 0) {
+            console.log("ℹ️ No pending items in queue");
+            return;
+        }
+        
+        console.log(`🔄 Found ${pendingCount} queued submissions to process...`);
+        
+        // Process each pending item
+        for (const index of pendingIndices) {
+            // Mark as processed
+            queueSheet.getRange(index + 1, 3).setValue("Yes");
+            queueSheet.getRange(index + 1, 4).setValue(new Date());
+            
+            // Process this specific mnemonic
+            const mnemonic = queueData[index][1];
+            if (mnemonic) {
+                gradeResponsesForMnemonic(mnemonic);
+            }
+        }
+        
+        console.log("✅ Queue processing complete");
+        
+    } catch (e) {
+        console.error("❌ Error in processQueue:", e.message, e.stack);
+        logError('Process Queue', `Error processing queue: ${e.message}\n${e.stack}`);
+    } finally {
+        if (lock.hasLock()) {
+            lock.releaseLock();
         }
     }
-    
-    if (pendingIndices.length === 0) {
-        console.log("No pending items in queue");
-        return;
-    }
-    
-    console.log(`Found ${pendingIndices.length} queued submissions to process...`);
-    
-    // Process each submission
-    for (const index of pendingIndices) {
-        const mnemonic = queueData[index][1];
-        gradeResponsesForMnemonic(mnemonic);
-        
-        // Mark as processed
-        queueSheet.getRange(index + 1, 3).setValue("Yes");
-        queueSheet.getRange(index + 1, 4).setValue(new Date());
-    }
+}
+
+/**
+ * Manually test Grading Workflow
+ */
+function testGradingWorkflow() {
+  console.log("Starting grading workflow test...");
+  
+  console.log("Step 1: Running syncResponses()...");
+  const newResponses = syncResponses();
+  console.log(`Synced ${newResponses.length} responses`);
+  
+  console.log("Step 2: Running gradeResponses()...");
+  const startTime = new Date().getTime();
+  gradeResponses();
+  const executionTime = (new Date().getTime() - startTime) / 1000;
+  console.log(`gradeResponses completed in ${executionTime} seconds`);
+  
+  console.log("Test completed!");
 }
 
 /**
@@ -1853,7 +1874,7 @@ function onOpen() {
         .addItem('Add Test Data (10 Entries)', 'addTestData')
         .addItem('Clear Caches', 'clearCaches')
         .addSeparator()
-        .addItem('Setup Automatic Processing', 'setupTriggers')
+        .addItem('Setup Automatic Processing', 'showTriggerSetupDialog') // Updated to new function
         .addItem('Update Audit Log Formatting', 'updateAuditLogFormatting')
         .addItem('Add Manual Points', 'showManualPointsDialog')
         .addItem('Process Manual Form Grades', 'handleFormGradeOverride')
@@ -1898,4 +1919,23 @@ function shortenAnswerText(answer, maxLength = 50) {
     return answer.substring(0, maxLength) + "...";
 }
 
+/**
+ * Get ungraded responses efficiently
+ */
+function getUngradedResponses(responsesSheet, validMnemonics) {
+    const data = responsesSheet.getDataRange().getValues();
+    const result = [];
+    
+    // Create a Set for faster lookups
+    const validMnemonicsSet = new Set(validMnemonics.map(m => m.toLowerCase()));
+    
+    for (let i = 1; i < data.length; i++) {
+        const mnemonic = data[i][1]?.toString().toLowerCase();
+        if (data[i][4] !== "Yes" && mnemonic && validMnemonicsSet.has(mnemonic)) {
+            result.push([i, data[i]]);
+        }
+    }
+    
+    return result;
+}
 
