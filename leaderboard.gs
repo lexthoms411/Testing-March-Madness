@@ -77,18 +77,20 @@ function getTeamData(teamsSheet) {
 }
 
 /**
- * Get team scores from Team Scores sheet
+ * Get team scores from Team Scores sheet columns T and U
  */
 function getTeamScoresData(teamScoresSheet) {
     const data = teamScoresSheet.getDataRange().getValues();
     const teamScores = [];
     
-    // Skip header row
+    // Find columns T and U (indices 19 and 20 since they're 0-indexed)
+    // Scan for rows with data in these columns
     for (let i = 1; i < data.length; i++) {
-        if (data[i][0]) { // If team name exists
+        // Check if there's a team name in column T
+        if (data[i][19] && typeof data[i][19] === 'string' && data[i][19].trim() !== '') {
             teamScores.push({
-                team: data[i][0],
-                score: Number(data[i][1]) || 0,  // Total score in column B
+                team: data[i][19],  // Team name from column T
+                score: Number(data[i][20]) || 0,  // Total score from column U
                 avgScore: 0  // Not used but kept for compatibility
             });
         }

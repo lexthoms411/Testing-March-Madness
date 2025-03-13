@@ -1,5 +1,5 @@
 /**
- * Main grading function with enhanced error handling
+ * Main grading function with optimizations, smart comma handling, and partial correctness
  */
 function gradeResponses() {
     // Use lock service to prevent concurrent execution
@@ -24,35 +24,24 @@ function gradeResponses() {
             logError('Grade Responses', 'Missing required sheets');
             return;
         }
-        
-        // Check if audit log sheet has header
-        if (auditLogSheet.getLastRow() === 0) {
-            console.log("Initializing Audit Log sheet with header row");
-            auditLogSheet.appendRow([
-                "Timestamp", "Mnemonic", "Question ID", "Answer", "Correct?", 
-                "Duplicate?", "Correct Role?", "Previous Points", "Earned Points", 
-                "Total Points", "Status"
-            ]);
-        }
 
-        // Get valid mnemonics with caching
-        const validMnemonics = getValidMnemonicsWithCache(scoresSheet);
-        
-        // Check if raw responses sheet has any data
-        const lastRow = responsesSheet.getLastRow();
-        if (lastRow <= 1) {
-            console.info("✅ No responses to process");
-            return;
-        }
-        
         // Get already processed responses with caching
         const processedResponses = getProcessedResponsesWithCache(auditLogSheet);
+
+        // Sync new responses
+        syncResponses();
 
         // Get question data with caching
         const questionMap = getQuestionMapWithCache(questionBankSheet);
         const answerMapping = getAnswerMappingWithCache(questionMap);
         
-        // Get ungraded responses
+        // NEW: Get options map for smart comma handling
+        const optionsMap = getOptionsMapWithCache(questionBankSheet);
+        
+        // Get valid mnemonics with caching
+        const validMnemonics = getValidMnemonicsWithCache(scoresSheet);
+
+        // Get only ungraded responses for efficiency
         const ungradedResponses = getUngradedResponses(responsesSheet, validMnemonics);
         
         if (ungradedResponses.length === 0) {
@@ -61,6 +50,9 @@ function gradeResponses() {
         }
         
         console.info(`🔍 Processing ${ungradedResponses.length} ungraded responses`);
+
+        // PERFORMANCE IMPROVEMENT: Build user data map once to avoid repeated scans
+        const userDataMap = buildUserDataMap(scoresSheet);
 
         let auditLogEntries = [];
         const MAX_EXECUTION_TIME = 250000; // 250 seconds (under 300s limit)
@@ -93,6 +85,13 @@ function gradeResponses() {
             
             if (!mnemonic || !answerData) continue;
 
+            // Get user data from map instead of repeated sheet lookups
+            const userData = userDataMap.get(mnemonic);
+            if (!userData) {
+                console.warn(`User ${mnemonic} not found in scores sheet`);
+                continue;
+            }
+
             for (const [qID, userAnswer] of Object.entries(answerData)) {
                 const responseKey = `${timestamp}_${mnemonic}_${qID}`.toLowerCase();
 
@@ -107,40 +106,80 @@ function gradeResponses() {
                     continue;
                 }
 
-                // Get current score before grading
-                const currentScore = getCurrentScore(scoresSheet, mnemonic);
+                // Get current score from user data map instead of scanning sheet
+                const currentScore = userData.score;
 
-                // Get actual role from the Scores sheet
-                const actualRole = getUserRole(scoresSheet, mnemonic).trim().toLowerCase();
+                // Get actual role from user data map instead of scanning sheet
+                const actualRole = (userData.role || "").trim().toLowerCase();
                 const requiredRole = (questionData.targetRole || "").trim().toLowerCase();
 
                 // Check both role mismatch & duplicate attempt at the same time
                 const correctRole = actualRole === requiredRole || !requiredRole;
-                const isDuplicate = hasAttemptedBefore(scoresSheet, mnemonic, qID);
+                
+                // Check attempts from user data map
+                const isDuplicate = hasAttemptInUserData(userData, qID);
 
-                // Grade answer regardless of eligibility
-                const isCorrect = isAnswerCorrect(userAnswer, questionData.correctAnswer, questionData.type);
+                // UPDATED: Get options for this question for smart comma handling
+                const questionOptions = optionsMap[qID] || [];
+
+                // UPDATED: Variables to track correctness and partial credit
+                const isMultipleSelect = questionData.type && questionData.type.toLowerCase() === "multiple select";
+                let isCorrect = false;
+                let isPartiallyCorrect = false;
                 let earnedPoints = 0;
+
+                // Grade the answer
+                isCorrect = isAnswerCorrect(
+                    userAnswer, 
+                    questionData.correctAnswer, 
+                    questionData.type,
+                    questionOptions
+                );
 
                 // Only award points if eligible (correct role and not duplicate)
                 if (correctRole && !isDuplicate) {
-                    if (questionData.type && questionData.type.toLowerCase() === "multiple select") {
+                    if (isMultipleSelect) {
+                        // Calculate partial credit for multiple select
                         earnedPoints = calculatePartialCredit(
                             userAnswer,
                             questionData.correctAnswer,
                             questionData.type,
-                            questionData.points
+                            questionData.points,
+                            questionOptions
                         );
+                        
+                        // Check if this is partially correct (some points but not full)
+                        if (earnedPoints > 0 && earnedPoints < questionData.points) {
+                            isPartiallyCorrect = true;
+                        }
                     } else {
                         earnedPoints = isCorrect ? questionData.points : 0;
                     }
 
-                    // Update scores
+                    // Update scores and user data map
                     updateScores(scoresSheet, mnemonic, qID, earnedPoints, timestamp);
+                    
+                    // Update the in-memory score as well
+                    userData.score += earnedPoints;
+                    
+                    // Add the attempt to userData
+                    if (!userData.attempts) userData.attempts = {};
+                    userData.attempts[qID] = { timestamp, points: earnedPoints };
+                }
+
+                // Determine correctness display status for audit log
+                let correctnessStatus;
+                if (isPartiallyCorrect) {
+                    correctnessStatus = "Partially Correct";
+                } else if (isCorrect) {
+                    correctnessStatus = "Correct";
+                } else {
+                    correctnessStatus = "Incorrect";
                 }
 
                 // Update raw responses with correct/incorrect status
-                responsesSheet.getRange(rowIndex + 1, 6).setValue(isCorrect ? "Correct" : "Incorrect");
+                // For the response sheet, we'll still use binary Correct/Incorrect
+                responsesSheet.getRange(rowIndex + 1, 6).setValue(isCorrect || isPartiallyCorrect ? "Correct" : "Incorrect");
 
                 // Get shortened answers for display
                 let formattedUserAnswer = getAnswerLetters(userAnswer, qID, answerMapping);
@@ -149,13 +188,13 @@ function gradeResponses() {
                 // Short display version for audit log
                 const answerDisplay = `Answer: ${shortenAnswerText(formattedUserAnswer)} (Expected: ${shortenAnswerText(formattedCorrectAnswer)})`;
 
-                // Log to audit with new column structure
+                // Log to audit with new column structure and updated correctness status
                 auditLogEntries.push([
                     timestamp,                    // Timestamp
                     mnemonic,                    // Mnemonic
                     qID,                         // Question ID
                     answerDisplay,               // Shortened answer
-                    isCorrect ? "Correct" : "Incorrect",  // Correct? (now shows regardless of status)
+                    correctnessStatus,           // UPDATED: Now shows "Partially Correct" when applicable
                     isDuplicate ? "Yes" : "No",  // Duplicate Attempt?
                     correctRole ? "Yes" : "No",  // Correct Role?
                     currentScore,                // Previous Points
@@ -182,8 +221,8 @@ function gradeResponses() {
             appendToAuditLog(auditLogSheet, auditLogEntries);
         }
 
-        // Update audit log formatting
-        updateAuditLogFormatting();
+        // Update audit log formatting with new conditional formatting for "Partially Correct"
+        updateAuditLogFormattingWithPartialCorrect();
         
         // Update leaderboards
         updateLeaderboard();
@@ -191,8 +230,7 @@ function gradeResponses() {
         // Update Processed Responses
         updateProcessedResponses();
 
-        const executionTime = (new Date().getTime() - startTime) / 1000;
-        console.info(`🎉 Grading complete! Execution time: ${executionTime} seconds`);
+        console.info("🎉 Grading complete!");
     } catch (e) {
         console.error("❌ Error in grading process:", e.message, e.stack);
         logError('Grade Responses', `Error in grading process: ${e.message}\n${e.stack}`);
@@ -201,6 +239,147 @@ function gradeResponses() {
             lock.releaseLock();
         }
     }
+}
+
+/**
+ * Update audit log formatting, including special formatting for "Partially Correct"
+ */
+function updateAuditLogFormattingWithPartialCorrect() {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const auditSheet = ss.getSheetByName(SHEETS.AUDIT_LOG);
+    
+    if (!auditSheet) return;
+    
+    // Only update formatting periodically to avoid excess API calls
+    const props = PropertiesService.getScriptProperties();
+    const lastFormatTime = props.getProperty('lastAuditFormatTime');
+    const now = new Date().getTime();
+    
+    if (lastFormatTime && now - parseInt(lastFormatTime) < 300000) { // 5 minutes
+        return; // Skip if formatted recently
+    }
+    
+    // Clear existing rules
+    auditSheet.clearConditionalFormatRules();
+    
+    // Get last row
+    const lastRow = Math.max(auditSheet.getLastRow(), 1);
+    
+    // Create rules array
+    const rules = [];
+    
+    // Status column (column K or 11)
+    const statusColumn = 11;
+    const statusRange = auditSheet.getRange(2, statusColumn, lastRow - 1, 1);
+    
+    // Correctness column (column E or 5)
+    const correctnessColumn = 5;
+    const correctnessRange = auditSheet.getRange(2, correctnessColumn, lastRow - 1, 1);
+    
+    // Duplicate attempts - yellow
+    rules.push(SpreadsheetApp.newConditionalFormatRule()
+        .whenTextContains("Duplicate")
+        .setBackground("#FFF2CC")
+        .setRanges([statusRange])
+        .build());
+    
+    // Role mismatch - orange
+    rules.push(SpreadsheetApp.newConditionalFormatRule()
+        .whenTextContains("Role Mismatch")
+        .setBackground("#FCE5CD")
+        .setRanges([statusRange])
+        .build());
+    
+    // Processed - green
+    rules.push(SpreadsheetApp.newConditionalFormatRule()
+        .whenTextContains("Processed")
+        .setBackground("#D9EAD3")
+        .setRanges([statusRange])
+        .build());
+    
+    // Manual addition - blue
+    rules.push(SpreadsheetApp.newConditionalFormatRule()
+        .whenTextContains("Manual")
+        .setBackground("#CFE2F3")
+        .setRanges([statusRange])
+        .build());
+    
+    // Errors - red
+    rules.push(SpreadsheetApp.newConditionalFormatRule()
+        .whenTextContains("Error")
+        .setBackground("#F4CCCC")
+        .setRanges([statusRange])
+        .build());
+    
+    // NEW: Format for correctness column
+    // Correct - green
+    rules.push(SpreadsheetApp.newConditionalFormatRule()
+        .whenTextEqualTo("Correct")
+        .setBackground("#D9EAD3")
+        .setFontColor("#38761d")
+        .setRanges([correctnessRange])
+        .build());
+    
+    // Partially Correct - light green/yellow
+    rules.push(SpreadsheetApp.newConditionalFormatRule()
+        .whenTextEqualTo("Partially Correct")
+        .setBackground("#E7F1D7") // lighter green
+        .setFontColor("#7F6000")  // dark yellow/gold
+        .setRanges([correctnessRange])
+        .build());
+    
+    // Incorrect - light red
+    rules.push(SpreadsheetApp.newConditionalFormatRule()
+        .whenTextEqualTo("Incorrect")
+        .setBackground("#F4CCCC")
+        .setFontColor("#990000")
+        .setRanges([correctnessRange])
+        .build());
+    
+    // Apply all rules
+    auditSheet.setConditionalFormatRules(rules);
+    
+    // Store last format time
+    props.setProperty('lastAuditFormatTime', now.toString());
+}
+
+/**
+ * Helper function to build a map of user data for faster lookups
+ */
+function buildUserDataMap(scoresSheet) {
+    const data = scoresSheet.getDataRange().getValues();
+    const userMap = new Map();
+    
+    for (let i = 1; i < data.length; i++) {
+        if (data[i][0]) { // If mnemonic exists
+            try {
+                // Parse attempts JSON if it exists
+                let attempts = {};
+                if (data[i][5]) {
+                    attempts = JSON.parse(data[i][5] || "{}");
+                }
+                
+                userMap.set(data[i][0].toLowerCase(), {
+                    score: Number(data[i][3]) || 0,  // Total score
+                    role: data[i][2] || "",         // User role
+                    rowIndex: i + 1,                // For updates later
+                    attempts: attempts              // Parsed attempts
+                });
+            } catch (e) {
+                console.error(`Error parsing attempts for ${data[i][0]}:`, e);
+            }
+        }
+    }
+    
+    return userMap;
+}
+
+/**
+ * Check if user has attempted question before using userData
+ */
+function hasAttemptInUserData(userData, questionID) {
+    if (!userData.attempts) return false;
+    return questionID in userData.attempts;
 }
 
 /**
@@ -215,92 +394,24 @@ function continueGrading() {
         }
     }
     
-    // Get saved state
-    try {
-        const stateJson = PropertiesService.getScriptProperties().getProperty('continueGradingState');
-        if (stateJson) {
-            const state = JSON.parse(stateJson);
-            console.log(`Continuing grading from batch ${state.batchStart}/${state.totalResponses}`);
-        }
-    } catch (e) {
-        console.error("Error retrieving state:", e);
-    }
-    
     // Continue grading
     gradeResponses();
 }
 
 /**
- * Apply batch updates to a sheet efficiently
+ * Get ungraded responses efficiently
  */
-function applyBatchUpdates(sheet, updates, columnIndex) {
-    if (!updates || updates.length === 0) return;
-    
-    // Group updates by value for more efficient processing
-    const valueGroups = {};
-    for (const update of updates) {
-        if (!valueGroups[update.value]) {
-            valueGroups[update.value] = [];
-        }
-        valueGroups[update.value].push(update.rowIndex);
-    }
-    
-    // Apply each group of updates
-    for (const [value, rowIndices] of Object.entries(valueGroups)) {
-        if (rowIndices.length === 1) {
-            // Single update
-            retryOperation(() => {
-                sheet.getRange(rowIndices[0], columnIndex).setValue(value);
-            });
-        } else {
-            // Build ranges for each consecutive group of rows
-            let currentGroup = [rowIndices[0]];
-            
-            for (let i = 1; i < rowIndices.length; i++) {
-                // If the current row is consecutive with the previous one
-                if (rowIndices[i] === currentGroup[currentGroup.length - 1] + 1) {
-                    currentGroup.push(rowIndices[i]);
-                } else {
-                    // Apply the current group and start a new one
-                    const startRow = currentGroup[0];
-                    const numRows = currentGroup.length;
-                    retryOperation(() => {
-                        sheet.getRange(startRow, columnIndex, numRows, 1)
-                            .setValue(value);
-                    });
-                    
-                    // Start a new group
-                    currentGroup = [rowIndices[i]];
-                }
-            }
-            
-            // Apply the last group
-            if (currentGroup.length > 0) {
-                const startRow = currentGroup[0];
-                const numRows = currentGroup.length;
-                retryOperation(() => {
-                    sheet.getRange(startRow, columnIndex, numRows, 1)
-                        .setValue(value);
-                });
-            }
-        }
-    }
-}
-
-/**
- * Get ungraded responses efficiently - optimized version
- * This directly accesses the data array rather than sheet ranges
- */
-function getUngradedResponsesOptimized(responsesData, validMnemonics) {
+function getUngradedResponses(responsesSheet, validMnemonics) {
+    const data = responsesSheet.getDataRange().getValues();
     const result = [];
     
     // Create a Set for faster lookups
-    const validMnemonicsSet = new Set(validMnemonics.map(m => m.toLowerCase()));
+    const validMnemonicsSet = new Set(validMnemonics);
     
-    for (let i = 1; i < responsesData.length; i++) {
-        const mnemonic = responsesData[i][1]?.toString().toLowerCase();
-        if (responsesData[i][4] !== "Yes" && mnemonic && validMnemonicsSet.has(mnemonic)) {
-            result.push([i, responsesData[i]]);
+    for (let i = 1; i < data.length; i++) {
+        const mnemonic = data[i][1]?.toLowerCase();
+        if (data[i][4] !== "Yes" && mnemonic && validMnemonicsSet.has(mnemonic)) {
+            result.push([i, data[i]]);
         }
     }
     
@@ -308,186 +419,24 @@ function getUngradedResponsesOptimized(responsesData, validMnemonics) {
 }
 
 /**
- * Get valid mnemonics with caching - optimized to return lowercase values for proper comparison
- */
-function getValidMnemonicsWithCache(scoresSheet) {
-    const cache = CacheService.getScriptCache();
-    const cacheKey = 'validMnemonics';
-    
-    // Try to get from cache first
-    const cachedData = cache.get(cacheKey);
-    if (cachedData) {
-        try {
-            return JSON.parse(cachedData);
-        } catch (e) {
-            console.warn("⚠️ Cache parse error, rebuilding valid mnemonics");
-        }
-    }
-    
-    // If not in cache or parse error, rebuild
-    const validMnemonics = scoresSheet.getRange('A2:A')
-        .getValues()
-        .map(row => row[0]?.toString().toLowerCase())
-        .filter(Boolean);
-    
-    // Cache for 6 hours
-    cache.put(cacheKey, JSON.stringify(validMnemonics), 21600);
-    
-    return validMnemonics;
-}
-
-/**
- * Flush all queued items (admin function for immediate processing)
- * Optimized version that uses batch processing
- */
-function flushQueue() {
-    const lock = LockService.getScriptLock();
-    try {
-        if (!lock.tryLock(10000)) {
-            console.log("Could not obtain lock for flushing queue. Another process is running.");
-            return;
-        }
-        
-        console.log("🔄 Flushing all queued submissions...");
-        
-        const sheet = SpreadsheetApp.getActiveSpreadsheet();
-        const queueSheet = sheet.getSheetByName("Processing Queue");
-        
-        if (!queueSheet) {
-            console.log("ℹ️ No queue sheet found - nothing to process");
-            return;
-        }
-        
-        const queueData = queueSheet.getDataRange().getValues();
-        if (queueData.length <= 1) {
-            console.log("ℹ️ No items in queue to process");
-            return;
-        }
-        
-        // Find all pending indices
-        const pendingIndices = [];
-        for (let i = 1; i < queueData.length; i++) {
-            if (queueData[i][2] === "No") {
-                pendingIndices.push(i);
-            }
-        }
-        
-        if (pendingIndices.length === 0) {
-            console.log("ℹ️ No pending items in queue");
-            return;
-        }
-        
-        console.log(`🔄 Flushing ${pendingIndices.length} queued submissions...`);
-        
-        // Process all pending items
-        const BATCH_SIZE = 20; // Increased batch size for efficiency
-        const startTime = new Date().getTime();
-        const MAX_EXECUTION_TIME = 250000; // 250 seconds
-        
-        let processedCount = 0;
-        
-        // First sync all responses to make sure we have the latest data
-        syncResponses();
-        
-        for (let i = 0; i < pendingIndices.length; i += BATCH_SIZE) {
-            // Check if approaching time limit
-            if (new Date().getTime() - startTime > MAX_EXECUTION_TIME) {
-                console.warn(`⏱️ Approaching time limit. Processed ${processedCount} items.`);
-                
-                // Schedule continuation
-                const remainingIndices = pendingIndices.slice(i);
-                PropertiesService.getScriptProperties().setProperty(
-                    'flushQueueState', 
-                    JSON.stringify({indices: remainingIndices})
-                );
-                
-                ScriptApp.newTrigger('continueFlushQueue')
-                    .timeBased()
-                    .after(1000) // 1 second
-                    .create();
-                    
-                return;
-            }
-            
-            const batchIndices = pendingIndices.slice(i, i + BATCH_SIZE);
-            processBatchFromQueue(batchIndices, queueSheet, queueData);
-            processedCount += batchIndices.length;
-        }
-        
-        console.log(`✅ Successfully flushed ${processedCount} queued submissions`);
-        
-        // Update processed responses and leaderboards
-        updateProcessedResponses();
-        updateLeaderboard();
-        
-    } catch (e) {
-        console.error("❌ Error in flushQueue:", e.message, e.stack);
-        logError('Flush Queue', `Error flushing queue: ${e.message}\n${e.stack}`);
-    } finally {
-        if (lock.hasLock()) {
-            lock.releaseLock();
-        }
-    }
-}
-
-/**
- * Continue flushing queue from where we left off
- */
-function continueFlushQueue() {
-    // Delete all triggers for this function to prevent duplicates
-    const triggers = ScriptApp.getProjectTriggers();
-    for (let i = 0; i < triggers.length; i++) {
-        if (triggers[i].getHandlerFunction() === 'continueFlushQueue') {
-            ScriptApp.deleteTrigger(triggers[i]);
-        }
-    }
-    
-    // Get saved state
-    try {
-        const stateJson = PropertiesService.getScriptProperties().getProperty('flushQueueState');
-        if (stateJson) {
-            const state = JSON.parse(stateJson);
-            console.log(`Continuing queue flush with ${state.indices.length} remaining items`);
-            
-            const sheet = SpreadsheetApp.getActiveSpreadsheet();
-            const queueSheet = sheet.getSheetByName("Processing Queue");
-            
-            if (queueSheet) {
-                const queueData = queueSheet.getDataRange().getValues();
-                flushQueue(); // This will pick up from where we left off
-            }
-        }
-    } catch (e) {
-        console.error("Error retrieving state:", e);
-    }
-}
-
-/**
- * Append to audit log with retry - optimized for batch operations
+ * Append to audit log with retry
  */
 function appendToAuditLog(auditLogSheet, entries) {
     if (!entries || entries.length === 0) return;
     
-    const MAX_ENTRIES_PER_BATCH = 50;
-    
-    // Process in batches to avoid rate limits
-    for (let i = 0; i < entries.length; i += MAX_ENTRIES_PER_BATCH) {
-        const batch = entries.slice(i, Math.min(i + MAX_ENTRIES_PER_BATCH, entries.length));
-        
-        retryOperation(() => {
-            const lastRow = auditLogSheet.getLastRow();
-            auditLogSheet.getRange(
-                lastRow + 1, 
-                1, 
-                batch.length, 
-                batch[0].length
-            ).setValues(batch);
-        }, 4); // Increased max retries
-    }
+    return retryOperation(() => {
+        const lastRow = auditLogSheet.getLastRow();
+        auditLogSheet.getRange(
+            lastRow + 1, 
+            1, 
+            entries.length, 
+            entries[0].length
+        ).setValues(entries);
+    });
 }
 
 /**
- * Get processed responses with caching - optimized version with empty sheet handling
+ * Get processed responses with caching
  */
 function getProcessedResponsesWithCache(auditLogSheet) {
     const cache = CacheService.getScriptCache();
@@ -497,69 +446,51 @@ function getProcessedResponsesWithCache(auditLogSheet) {
     const cachedData = cache.get(cacheKey);
     if (cachedData) {
         try {
-            // Deserialize from JSON
             return new Set(JSON.parse(cachedData));
         } catch (e) {
             console.warn("⚠️ Cache parse error, rebuilding processed responses");
         }
     }
     
-    // If not in cache or parse error, rebuild more efficiently
+    // If not in cache or parse error, rebuild
     const processedResponses = new Set();
-    
-    // Check if sheet has data beyond the header row
-    const lastRow = auditLogSheet.getLastRow();
-    
-    if (lastRow > 1) {
-        // Get only the columns we need (timestamp, mnemonic, questionId)
-        const auditData = auditLogSheet.getRange(2, 1, lastRow - 1, 3).getValues();
+    const auditData = auditLogSheet.getDataRange().getValues();
 
-        for (const row of auditData) {
-            if (row[0] && row[1] && row[2]) {
-                const key = `${row[0]}_${String(row[1]).toLowerCase()}_${row[2]}`;
-                processedResponses.add(key);
-            }
-        }
-        
-        // Store in cache for future use
-        try {
-            cache.put(cacheKey, JSON.stringify(Array.from(processedResponses)), 21600);
-        } catch (e) {
-            console.warn("⚠️ Error storing cache:", e.message);
-        }
-    } else {
-        console.log("Audit log is empty (only header row) - no processed responses to load");
+    for (let i = 1; i < auditData.length; i++) {
+        const key = `${auditData[i][0]}_${auditData[i][1]}_${auditData[i][2]}`.toLowerCase();
+        processedResponses.add(key);
+    }
+    
+    // Store in cache for 6 hours (needs to be serialized as array)
+    // Since there are size limitations, we'll only cache if it's not too large
+    if (processedResponses.size < 5000) {
+        cache.put(cacheKey, JSON.stringify(Array.from(processedResponses)), 21600);
     }
 
     return processedResponses;
 }
 
 /**
- * Get question map with caching - optimized version
+ * Get question map with caching
  */
 function getQuestionMapWithCache(questionBankSheet) {
     const cache = CacheService.getScriptCache();
     const cacheKey = 'questionMap';
     
-    // Try to get from cache first
-    const cachedData = cache.get(cacheKey);
-    if (cachedData) {
-        try {
-            return JSON.parse(cachedData);
-        } catch (e) {
-            console.warn("⚠️ Cache parse error, rebuilding question map");
-        }
-    }
+    // Clear the cache first to force refresh
+    cache.remove(cacheKey);
     
-    // If not in cache or parse error, rebuild more efficiently
+    // Build the question map fresh
     const questionBankData = questionBankSheet.getDataRange().getValues();
     const questionMap = {};
     
-    // OPTIMIZATION: Skip header and process only necessary columns
     for (let i = 1; i < questionBankData.length; i++) {
         const row = questionBankData[i];
         const qID = row[1];
         if (qID) {
+            // Log the correctAnswer for debugging
+            console.log(`Question ${qID} correct answer: ${row[9]}`);
+            
             questionMap[qID] = {
                 question: row[2],
                 correctAnswer: row[9],
@@ -570,39 +501,14 @@ function getQuestionMapWithCache(questionBankSheet) {
         }
     }
     
-    // OPTIMIZATION: Compress data for storage if needed
-    try {
-        const jsonString = JSON.stringify(questionMap);
-        
-        // Cache for 6 hours - handle oversized data
-        if (jsonString.length < 100000) {
-            cache.put(cacheKey, jsonString, 21600);
-        } else {
-            console.warn("⚠️ Question map too large for cache, using partial caching");
-            
-            // Store most frequently used questions
-            const partialMap = {};
-            const questionIds = Object.keys(questionMap);
-            
-            // Take first 200 questions (or fewer if we have less)
-            const topQuestions = questionIds.slice(0, 200);
-            for (const id of topQuestions) {
-                partialMap[id] = questionMap[id];
-            }
-            
-            cache.put(cacheKey, JSON.stringify(partialMap), 21600);
-        }
-    } catch (e) {
-        console.warn("⚠️ Error caching question map:", e.message);
-    }
-    
     return questionMap;
 }
 
 /**
- * Get answer mapping with caching - optimized version
+ * Get answer mapping with caching
  */
-function getAnswerMappingWithCache(questionMap) {
+/**
+ * is function getAnswerMappingWithCache(questionMap) {
     const cache = CacheService.getScriptCache();
     const cacheKey = 'answerMapping';
     
@@ -630,7 +536,6 @@ function getAnswerMappingWithCache(questionMap) {
         const type = row[10];
         
         if (qID && type && type.toLowerCase().includes("multiple")) {
-            // Only process multiple choice or select questions
             const options = [row[3], row[4], row[5], row[6], row[7], row[8]].filter(Boolean);
             const letterMap = {};
             
@@ -648,14 +553,11 @@ function getAnswerMappingWithCache(questionMap) {
     }
     
     // Cache for 6 hours
-    try {
-        cache.put(cacheKey, JSON.stringify(answerMapping), 21600);
-    } catch (e) {
-        console.warn("⚠️ Error caching answer mapping:", e.message);
-    }
+    cache.put(cacheKey, JSON.stringify(answerMapping), 21600);
     
     return answerMapping;
 }
+*/
 
 /**
  * Get valid mnemonics with caching
@@ -687,13 +589,13 @@ function getValidMnemonicsWithCache(scoresSheet) {
 }
 
 /**
- * Sync form responses to raw responses sheet with improved performance
+ * Sync form responses to raw responses sheet with improved error handling
  */
 function syncResponses() {
     // Use lock service to prevent concurrent execution
     const lock = LockService.getScriptLock();
     try {
-        if (!lock.tryLock(10000)) {
+        if (!lock.tryLock(10000)) { // 10 seconds timeout
             console.log("Could not obtain lock for syncing. Another process is running.");
             return [];
         }
@@ -710,6 +612,22 @@ function syncResponses() {
             return [];
         }
 
+        // Get last sync timestamp
+        const props = PropertiesService.getScriptProperties();
+        const lastSyncKey = 'lastSyncTimestamp';
+        let lastTimestamp = null;
+        
+        // Check if raw sheet is empty
+        const rawRowCount = rawResponsesSheet.getLastRow();
+        const isEmpty = rawRowCount <= 1;
+        
+        if (!isEmpty) {
+            const lastSyncTimestamp = props.getProperty(lastSyncKey);
+            if (lastSyncTimestamp) {
+                lastTimestamp = new Date(lastSyncTimestamp);
+            }
+        }
+
         // Get form data headers
         const headers = formResponsesSheet.getRange(1, 1, 1, formResponsesSheet.getLastColumn()).getValues()[0];
         
@@ -717,87 +635,110 @@ function syncResponses() {
         const rawData = rawResponsesSheet.getDataRange().getValues();
         const existingEntries = new Set();
         
-        // Map column indices based on your actual form structure
-        const timestampCol = 0;  // Column A (Timestamp)
-        const mnemonicCol = 2;   // Column C (Mnemonic) - adjust if different
-        const roleCol = 3;       // Column D (Role) - adjust if different
-        
-        // First answer column usually starts at index 4 (column E)
-        const firstAnswerCol = 4;
-        
-        for (let i = 1; i < rawData.length; i++) {
-            if (rawData[i][0] && rawData[i][1]) {
-                const key = `${rawData[i][0]}_${String(rawData[i][1]).toLowerCase()}`;
-                existingEntries.add(key);
+        if (!isEmpty) {
+            for (let i = 1; i < rawData.length; i++) {
+                if (rawData[i][0] && rawData[i][1] && rawData[i][2]) {
+                    const key = `${rawData[i][0]}_${String(rawData[i][1]).toLowerCase()}_${rawData[i][2]}`;
+                    existingEntries.add(key);
+                }
             }
         }
 
-        // Get form data
+        // Get form data (all or just new based on timestamp)
         const formData = formResponsesSheet.getDataRange().getValues();
         const newResponses = [];
+        let newTimestamp = lastTimestamp || new Date(0);
+        let skippedRows = 0;
+        let invalidMnemonics = 0;
 
         // Process each form response
         for (let i = 1; i < formData.length; i++) {
             const row = formData[i];
-            const timestamp = row[timestampCol];
+            const timestamp = row[0];
             
-            if (!timestamp) continue;
+            // Skip if older than last sync time
+            if (lastTimestamp && timestamp && timestamp < lastTimestamp) {
+                skippedRows++;
+                continue;
+            }
             
-            // Get mnemonic - adjust column if needed
-            const mnemonic = row[mnemonicCol]; 
+            // Track newest timestamp
+            if (timestamp && timestamp > newTimestamp) {
+                newTimestamp = timestamp;
+            }
+
+            // Look for mnemonic in the correct column (column C, index 2)
+            const mnemonic = row[2]; 
             
+            // Better validation of mnemonic
             if (!mnemonic || typeof mnemonic !== 'string' || mnemonic.trim() === '') {
                 console.warn(`⚠️ Invalid mnemonic at row ${i + 1}`);
+                invalidMnemonics++;
                 continue;
             }
 
             const mnemonicLower = mnemonic.toString().toLowerCase().trim();
+            if (mnemonicLower === '') {
+                console.warn(`⚠️ Empty mnemonic after trimming at row ${i + 1}`);
+                invalidMnemonics++;
+                continue;
+            }
             
-            // Get role
-            const role = row[roleCol] || '';
+            // Get role from column D (index 3)
+            const role = row[3] || '';
 
             // Process answers - collect question answers from remaining columns
-            const answerDataObj = {};
-            for (let col = firstAnswerCol; col < headers.length; col++) {
-                if (!headers[col]) continue;
+            let answerDataObj = {};
+            for (let col = 4; col < headers.length; col++) {
+                if (!headers[col]) continue; // Skip columns with no header
                 
                 const answer = row[col];
                 if (answer && answer.toString().trim() !== "") {
-                    // Extract question ID from header
-                    const questionID = extractQuestionID(headers[col]) || `Q${col - firstAnswerCol + 1}`;
-                    answerDataObj[questionID] = answer.toString().trim();
+                    const questionID = extractQuestionID(headers[col]);
+                    if (questionID) {
+                        answerDataObj[questionID] = answer.toString().trim();
+                    }
                 }
             }
 
             // Only add if we have at least one answer
             if (Object.keys(answerDataObj).length > 0) {
                 const answerJson = JSON.stringify(answerDataObj);
-                const entryKey = `${timestamp}_${mnemonicLower}`;
+                const entryKey = `${timestamp}_${mnemonicLower}_${answerJson}`;
 
-                // If this entry doesn't exist yet, add it
-                if (!existingEntries.has(entryKey)) {
+                // If raw sheet is empty OR this entry doesn't exist yet, add it
+                if (isEmpty || !existingEntries.has(entryKey)) {
                     const formattedRow = [timestamp, mnemonicLower, answerJson, role, "No", ""];
                     newResponses.push(formattedRow);
-                    existingEntries.add(entryKey);
+                    existingEntries.add(entryKey); // Add to set to avoid duplicates in this run
                 }
             }
         }
 
-        // Add new responses
+        // Add new responses in batches
         if (newResponses.length > 0) {
-            rawResponsesSheet.getRange(
-                rawResponsesSheet.getLastRow() + 1, 
-                1, 
-                newResponses.length, 
-                newResponses[0].length
-            ).setValues(newResponses);
+            const BATCH_SIZE = 50;
+            for (let i = 0; i < newResponses.length; i += BATCH_SIZE) {
+                const batch = newResponses.slice(i, Math.min(i + BATCH_SIZE, newResponses.length));
+                rawResponsesSheet.getRange(
+                    rawResponsesSheet.getLastRow() + 1, 
+                    1, 
+                    batch.length, 
+                    batch[0].length
+                ).setValues(batch);
+            }
             
-            // Apply formatting
+            // Store newest timestamp for next sync
+            if (newTimestamp > new Date(0)) {
+                props.setProperty(lastSyncKey, newTimestamp.toISOString());
+            }
+            
+            // Apply consistent formatting to new entries
             fixTimestampFormatting();
             fixTextAlignment();
         }
 
-        console.info(`✅ Synced ${newResponses.length} new responses.`);
+        console.info(`✅ Synced ${newResponses.length} new responses. Skipped ${skippedRows} old rows and ${invalidMnemonics} invalid mnemonics.`);
         return newResponses;
     } catch (e) {
         console.error("❌ Error in syncResponses:", e.message, e.stack);
@@ -810,9 +751,8 @@ function syncResponses() {
     }
 }
 
-
 /**
- * Optimized function to update scores in scores sheet
+ * Update scores in scores sheet with retry logic
  */
 function updateScores(scoresSheet, mnemonic, questionID, points, timestamp) {
     return retryOperation(() => {
@@ -829,50 +769,38 @@ function updateScores(scoresSheet, mnemonic, questionID, points, timestamp) {
             }
         }
 
-        // OPTIMIZATION: Use getRange instead of getDataRange for better performance
-        const mnemonicRange = scoresSheet.getRange('A2:A' + scoresSheet.getLastRow());
-        const mnemonics = mnemonicRange.getValues().map(row => String(row[0]).toLowerCase());
+        const scoresData = scoresSheet.getDataRange().getValues();
         const mnemonicLower = mnemonic.toLowerCase();
-        
-        // Find row index
-        const rowIndex = mnemonics.findIndex(m => m === mnemonicLower);
-        
-        if (rowIndex === -1) {
-            console.warn(`⚠️ Mnemonic ${mnemonic} not found in scores sheet`);
-            return;
-        }
-        
-        const actualRow = rowIndex + 2; // +2 because we started at A2 and arrays are 0-indexed
-        
-        if (!hasAttemptedBefore(scoresSheet, mnemonic, questionID)) {
-            // Get current score
-            const currentScore = Number(scoresSheet.getRange(actualRow, 4).getValue()) || 0;
-            const newScore = currentScore + points;
-            
-            // Update score
-            scoresSheet.getRange(actualRow, 4).setValue(newScore);
-            
-            // Update attempts - get current attempt data
-            let attempts = {};
-            try {
-                const attemptsJson = scoresSheet.getRange(actualRow, 6).getValue();
-                attempts = JSON.parse(attemptsJson || "{}");
-            } catch (e) {
-                console.error(`❌ Error parsing attempts for ${mnemonic}:`, e);
-                logError('Update Scores', `Error parsing attempts for ${mnemonic}: ${e.message}`);
+
+        for (let i = 1; i < scoresData.length; i++) {
+            const row = scoresData[i];
+            if (!row || row.length < 4 || !row[0]) continue; // Skip empty or malformed rows
+
+            if (row[0].toLowerCase() === mnemonicLower) {
+                if (!hasAttemptedBefore(scoresSheet, mnemonic, questionID)) {
+                    let currentScore = row[3] || 0;
+                    let newScore = currentScore + points;
+                    scoresSheet.getRange(i + 1, 4).setValue(newScore);
+
+                    let attempts = {};
+                    try {
+                        attempts = JSON.parse(row[5] || "{}");
+                    } catch (e) {
+                        console.error(`❌ Error parsing attempts for ${mnemonic}:`, e);
+                        logError('Update Scores', `Error parsing attempts for ${mnemonic}: ${e.message}`);
+                    }
+
+                    attempts[questionID] = { timestamp, points };
+                    scoresSheet.getRange(i + 1, 6).setValue(JSON.stringify(attempts));
+
+                    console.info(`✅ Updated score for ${mnemonic}: ${newScore} (Question: ${questionID}, Points: ${points})`);
+                } else {
+                    console.info(`ℹ️ Skipped score update - ${mnemonic} already attempted question ${questionID}`);
+                }
+                return;
             }
-            
-            // Add new attempt
-            attempts[questionID] = { timestamp, points };
-            
-            // Save updated attempts
-            scoresSheet.getRange(actualRow, 6).setValue(JSON.stringify(attempts));
-            
-            console.info(`✅ Updated score for ${mnemonic}: ${newScore} (Question: ${questionID}, Points: ${points})`);
-        } else {
-            console.info(`ℹ️ Skipped score update - ${mnemonic} already attempted question ${questionID}`);
         }
-    }, 4); // Increased retry count for this critical operation
+    });
 }
 
 /**
@@ -930,9 +858,8 @@ function resetAllScores() {
     }
 }
 
-
 /**
- * Optimized function to clear caches
+ * Clear script caches
  */
 function clearCaches() {
     const cache = CacheService.getScriptCache();
@@ -943,21 +870,9 @@ function clearCaches() {
         'validMnemonics'
     ];
     
-    // Check for chunked caches
-    const processedResponsesMeta = cache.get('processedResponses_meta');
-    if (processedResponsesMeta) {
-        try {
-            const meta = JSON.parse(processedResponsesMeta);
-            for (let i = 0; i < meta.chunks; i++) {
-                keysToDelete.push(`processedResponses_chunk_${i}`);
-            }
-        } catch (e) {
-            console.warn("Error parsing cache metadata:", e);
-        }
+    for (const key of keysToDelete) {
+        cache.remove(key);
     }
-    
-    // Delete all keys in one call for efficiency
-    cache.removeAll(keysToDelete);
     
     console.log("🧹 Cleared all caches");
 }
@@ -1053,9 +968,8 @@ function clearAuditLog() {
     }
 }
 
-
 /**
- * Setup all required triggers for the competition in one centralized function
+ * Setup all required triggers for the competition
  */
 function setupTriggers() {
     // Clear existing triggers
@@ -1063,20 +977,16 @@ function setupTriggers() {
     for (let i = 0; i < triggers.length; i++) {
         ScriptApp.deleteTrigger(triggers[i]);
     }
+
     
-    // 1. Create trigger to sync responses every 5 minutes
-    ScriptApp.newTrigger('syncResponses')
-        .timeBased()
-        .everyMinutes(5)
-        .create();
     
-    // 2. Create trigger to process the queue every 5 minutes (staggered by 1 minute)
+    // Create time trigger to process the queue every 5 minutes
     ScriptApp.newTrigger('processQueue')
         .timeBased()
         .everyMinutes(5)
         .create();
     
-    // 3. Create form submission trigger
+    // Get the form ID from the constants
     try {
         const form = FormApp.openById(FORM_ID);
         ScriptApp.newTrigger('onFormSubmit')
@@ -1088,39 +998,18 @@ function setupTriggers() {
         console.error("❌ Error creating form trigger: " + e.message);
     }
     
-    // 4. Create trigger to update leaderboard every 15 minutes
-    ScriptApp.newTrigger('updateLeaderboard')
-        .timeBased()
-        .everyMinutes(15)
-        .create();
-    
-    // 5. Create daily trigger for updating questions at midnight
-    ScriptApp.newTrigger('updateDailyQuestions')
-        .timeBased()
-        .atHour(0)
-        .everyDays(1)
-        .create();
-    
-    // 6. Create weekly trigger for determining weekly winners (runs every Sunday at 11:59 PM)
-    ScriptApp.newTrigger('determineWeeklyWinners')
-        .timeBased()
-        .onWeekDay(ScriptApp.WeekDay.SUNDAY)
-        .atHour(23)
-        .nearMinute(59)
-        .create();
-    
-    // 7. Create trigger to archive old data every 12 hours
+    // Create hourly trigger to archive old data
     ScriptApp.newTrigger('archiveOldData')
         .timeBased()
         .everyHours(12)
         .create();
-    
-    // 8. Optional: Create a trigger to clear caches periodically (every 6 hours)
-    ScriptApp.newTrigger('clearCaches')
-        .timeBased()
-        .everyHours(6)
-        .create();
-    
+
+    ScriptApp.newTrigger('updateDailyQuestions')
+      .timeBased()
+      .atHour(0)
+      .everyDays(1)
+      .create();
+        
     console.log("✅ All triggers set up successfully");
 }
 
@@ -1197,11 +1086,10 @@ function onFormSubmit(e) {
     }
 }
 
-
 /**
- * Process the queue of submissions
+ * Process the queue of submissions (runs every 5 minutes)
  */
-function processQueue() {
+/**function processQueue() {
     // Use lock service to prevent concurrent execution
     const lock = LockService.getScriptLock();
     try {
@@ -1212,17 +1100,6 @@ function processQueue() {
         
         console.log("🔄 Processing submission queue...");
         
-        // First make sure responses are synced from the form
-        syncResponses();
-        
-        // Now run the main grading function to handle all ungraded responses
-        try {
-            gradeResponses();
-        } catch (e) {
-            console.error("Error running gradeResponses:", e.message);
-        }
-        
-        // Process any items in the queue sheet
         const sheet = SpreadsheetApp.getActiveSpreadsheet();
         const queueSheet = sheet.getSheetByName("Processing Queue");
         
@@ -1231,13 +1108,11 @@ function processQueue() {
             return;
         }
         
-        // Check if queue sheet has data
-        if (queueSheet.getLastRow() <= 1) {
+        const queueData = queueSheet.getDataRange().getValues();
+        if (queueData.length <= 1) {
             console.log("ℹ️ No items in queue to process");
             return;
         }
-        
-        const queueData = queueSheet.getDataRange().getValues();
         
         // Count how many we need to process
         let pendingCount = 0;
@@ -1257,21 +1132,46 @@ function processQueue() {
         
         console.log(`🔄 Found ${pendingCount} queued submissions to process...`);
         
-        // Process each pending item
-        for (const index of pendingIndices) {
-            // Mark as processed
-            queueSheet.getRange(index + 1, 3).setValue("Yes");
-            queueSheet.getRange(index + 1, 4).setValue(new Date());
-            
-            // Process this specific mnemonic
-            const mnemonic = queueData[index][1];
-            if (mnemonic) {
-                gradeResponsesForMnemonic(mnemonic);
+        // Track execution time
+        const startTime = new Date().getTime();
+        const MAX_EXECUTION_TIME = 250000; // 250 seconds (under 300s limit)
+        
+        // Process in batches to avoid timeout
+        const BATCH_SIZE = 10;
+        const batchesToProcess = Math.min(BATCH_SIZE, pendingCount);
+        const batchIndices = pendingIndices.slice(0, batchesToProcess);
+        
+        console.log(`Processing first ${batchesToProcess} of ${pendingCount} pending items`);
+        
+        // First sync all responses to make sure we have the latest data
+        syncResponses();
+        
+        // Process only a batch of submissions
+        processBatchFromQueue(batchIndices, queueSheet, queueData);
+        
+        // Check if we've used too much time
+        const timeElapsed = new Date().getTime() - startTime;
+        
+        // If more remain and we have time, set up a trigger to continue processing
+        if (pendingCount > BATCH_SIZE) {
+            if (timeElapsed > MAX_EXECUTION_TIME) {
+                console.log(`⏱️ Time limit approaching. Will process remaining ${pendingCount - BATCH_SIZE} items in next cycle`);
+            } else {
+                console.log(`${pendingCount - BATCH_SIZE} items remain in queue for next processing cycle`);
+                
+                // Optionally trigger another immediate run for large backlogs
+                if (pendingCount > BATCH_SIZE * 3) {
+                    ScriptApp.newTrigger('processQueue')
+                        .timeBased()
+                        .after(60000) // 1 minute
+                        .create();
+                    console.log("⏱️ Scheduled additional queue processing in 1 minute due to large backlog");
+                }
             }
         }
         
-        console.log("✅ Queue processing complete");
-        
+        // Update processed responses sheet
+        updateProcessedResponses();
     } catch (e) {
         console.error("❌ Error in processQueue:", e.message, e.stack);
         logError('Process Queue', `Error processing queue: ${e.message}\n${e.stack}`);
@@ -1281,24 +1181,82 @@ function processQueue() {
         }
     }
 }
+*/
 
-/**
- * Manually test Grading Workflow
- */
-function testGradingWorkflow() {
-  console.log("Starting grading workflow test...");
-  
-  console.log("Step 1: Running syncResponses()...");
-  const newResponses = syncResponses();
-  console.log(`Synced ${newResponses.length} responses`);
-  
-  console.log("Step 2: Running gradeResponses()...");
-  const startTime = new Date().getTime();
-  gradeResponses();
-  const executionTime = (new Date().getTime() - startTime) / 1000;
-  console.log(`gradeResponses completed in ${executionTime} seconds`);
-  
-  console.log("Test completed!");
+function processQueue() {
+  const lock = LockService.getScriptLock();
+  try {
+    if (!lock.tryLock(10000)) {
+      console.log("Could not obtain lock for processing queue. Another process is running.");
+      return;
+    }
+    
+    console.log("🔄 Processing submission queue...");
+    
+    const sheet = SpreadsheetApp.getActiveSpreadsheet();
+    const queueSheet = sheet.getSheetByName("Processing Queue");
+    
+    if (!queueSheet) {
+      console.log("ℹ️ No queue sheet found - nothing to process");
+      return;
+    }
+    
+    const queueData = queueSheet.getDataRange().getValues();
+    if (queueData.length <= 1) {
+      console.log("ℹ️ No items in queue to process");
+      return;
+    }
+    
+    // Count how many we need to process
+    let pendingCount = 0;
+    const pendingIndices = [];
+    
+    for (let i = 1; i < queueData.length; i++) {
+      if (queueData[i][2] === "No") {
+        pendingCount++;
+        pendingIndices.push(i);
+        
+        // Only process a limited number at once to avoid timeout
+        if (pendingCount >= 5) break;
+      }
+    }
+    
+    if (pendingCount === 0) {
+      console.log("ℹ️ No pending items in queue");
+      return;
+    }
+    
+    console.log(`🔄 Processing ${pendingCount} queued submissions...`);
+    
+    // First sync all responses to make sure we have the latest data
+    // But skip if we already have processed a lot recently
+    if (pendingCount < 3) {
+      syncResponses();
+    }
+    
+    // Process limited batch to avoid timeout
+    const batchIndices = pendingIndices.slice(0, pendingCount);
+    processBatchFromQueue(batchIndices, queueSheet, queueData);
+    
+    // Only update processed responses if we're not about to time out
+    updateProcessedResponses();
+    
+    // If more remain, schedule another run
+    if (pendingCount < pendingIndices.length) {
+      ScriptApp.newTrigger('processQueue')
+        .timeBased()
+        .after(60000) // 1 minute
+        .create();
+      console.log("⏱️ Scheduled additional queue processing in 1 minute");
+    }
+  } catch (e) {
+    console.error("❌ Error in processQueue:", e.message, e.stack);
+    logError('Process Queue', `Error processing queue: ${e.message}\n${e.stack}`);
+  } finally {
+    if (lock.hasLock()) {
+      lock.releaseLock();
+    }
+  }
 }
 
 /**
@@ -1354,7 +1312,7 @@ function processBatchFromQueue(indices, queueSheet, queueData) {
 }
 
 /**
- * Grade responses for a specific mnemonic with retry
+ * Grade responses for a specific mnemonic with smart comma handling
  */
 function gradeResponsesForMnemonic(mnemonic) {
     // Check if mnemonic is valid
@@ -1368,9 +1326,12 @@ function gradeResponsesForMnemonic(mnemonic) {
     try {
         const sheet = SpreadsheetApp.getActiveSpreadsheet();
         const responsesSheet = sheet.getSheetByName("Form Responses (Raw)");
+        const questionBankSheet = sheet.getSheetByName(SHEETS.QUESTION_BANK);
+        const scoresSheet = sheet.getSheetByName(SHEETS.SCORES);
+        const auditLogSheet = sheet.getSheetByName(SHEETS.AUDIT_LOG);
         
-        if (!responsesSheet) {
-            console.error("❌ Missing Form Responses (Raw) sheet");
+        if (!responsesSheet || !questionBankSheet || !scoresSheet || !auditLogSheet) {
+            console.error("❌ Missing required sheets for grading");
             return;
         }
         
@@ -1394,16 +1355,6 @@ function gradeResponsesForMnemonic(mnemonic) {
         
         console.log(`Found ${rowsToGrade.length} responses to grade for ${mnemonic}`);
         
-        // Grade the responses directly
-        const auditLogSheet = sheet.getSheetByName(SHEETS.AUDIT_LOG);
-        const scoresSheet = sheet.getSheetByName(SHEETS.SCORES);
-        const questionBankSheet = sheet.getSheetByName(SHEETS.QUESTION_BANK);
-        
-        if (!auditLogSheet || !scoresSheet || !questionBankSheet) {
-            console.error("❌ Missing required sheets for grading");
-            return;
-        }
-        
         // Get processed responses
         const processedResponses = getProcessedResponsesWithCache(auditLogSheet);
         
@@ -1411,9 +1362,12 @@ function gradeResponsesForMnemonic(mnemonic) {
         const questionMap = getQuestionMapWithCache(questionBankSheet);
         const answerMapping = getAnswerMappingWithCache(questionMap);
         
-        // Process each ungraded response for this mnemonic
+        // NEW: Get options map for smart comma handling
+        const optionsMap = getOptionsMapWithCache(questionBankSheet);
+        
         let auditLogEntries = [];
         
+        // Process each ungraded response for this mnemonic
         for (const rowIndex of rowsToGrade) {
             const row = data[rowIndex];
             const timestamp = row[0];
@@ -1443,19 +1397,39 @@ function gradeResponsesForMnemonic(mnemonic) {
                 const correctRole = actualRole === requiredRole || !requiredRole;
                 const isDuplicate = hasAttemptedBefore(scoresSheet, mnemonic, qID);
                 
-                // Grade answer
-                const isCorrect = isAnswerCorrect(userAnswer, questionData.correctAnswer, questionData.type);
+                // UPDATED: Get options for this question for smart comma handling
+                const questionOptions = optionsMap[qID] || [];
+                
+                // UPDATED: Variables to track correctness and partial credit
+                const isMultipleSelect = questionData.type && questionData.type.toLowerCase() === "multiple select";
+                let isCorrect = false;
+                let isPartiallyCorrect = false;
                 let earnedPoints = 0;
                 
-                // Award points if eligible
+                // UPDATED: Grade answer using smart comma handling
+                isCorrect = isAnswerCorrect(
+                    userAnswer, 
+                    questionData.correctAnswer, 
+                    questionData.type,
+                    questionOptions
+                );
+                
+                // Only award points if eligible
                 if (correctRole && !isDuplicate) {
-                    if (questionData.type && questionData.type.toLowerCase() === "multiple select") {
+                    if (isMultipleSelect) {
+                        // UPDATED: Calculate partial credit using smart comma handling
                         earnedPoints = calculatePartialCredit(
                             userAnswer,
                             questionData.correctAnswer,
                             questionData.type,
-                            questionData.points
+                            questionData.points,
+                            questionOptions
                         );
+                        
+                        // Check if this is partially correct (some points but not full)
+                        if (earnedPoints > 0 && earnedPoints < questionData.points) {
+                            isPartiallyCorrect = true;
+                        }
                     } else {
                         earnedPoints = isCorrect ? questionData.points : 0;
                     }
@@ -1464,14 +1438,24 @@ function gradeResponsesForMnemonic(mnemonic) {
                     updateScores(scoresSheet, mnemonic, qID, earnedPoints, timestamp);
                 }
                 
-                // Mark as graded in raw responses
+                // Determine correctness display status for audit log
+                let correctnessStatus;
+                if (isPartiallyCorrect) {
+                    correctnessStatus = "Partially Correct";
+                } else if (isCorrect) {
+                    correctnessStatus = "Correct";
+                } else {
+                    correctnessStatus = "Incorrect";
+                }
+                
+                // Update raw responses with correct/incorrect status
                 retryOperation(() => {
-                    responsesSheet.getRange(rowIndex + 1, 6).setValue(isCorrect ? "Correct" : "Incorrect");
+                    responsesSheet.getRange(rowIndex + 1, 6).setValue(isCorrect || isPartiallyCorrect ? "Correct" : "Incorrect");
                 });
                 
-                // Get shortened answers for display
-                let formattedUserAnswer = getAnswerLetters(userAnswer, qID, answerMapping);
-                let formattedCorrectAnswer = getAnswerLetters(questionData.correctAnswer, qID, answerMapping);
+                // UPDATED: Get shortened answers for display with smart comma handling
+                let formattedUserAnswer = getAnswerLetters(userAnswer, qID, answerMapping, questionOptions);
+                let formattedCorrectAnswer = getAnswerLetters(questionData.correctAnswer, qID, answerMapping, questionOptions);
                 
                 // Short display version for audit log
                 const answerDisplay = `Answer: ${shortenAnswerText(formattedUserAnswer)} (Expected: ${shortenAnswerText(formattedCorrectAnswer)})`;
@@ -1482,8 +1466,8 @@ function gradeResponsesForMnemonic(mnemonic) {
                     mnemonic,                    // Mnemonic
                     qID,                         // Question ID
                     answerDisplay,               // Shortened answer
-                    isCorrect ? "Correct" : "Incorrect",  // Correct?
-                    isDuplicate ? "Yes" : "No",  // Duplicate?
+                    correctnessStatus,           // UPDATED: Now shows "Partially Correct" when applicable
+                    isDuplicate ? "Yes" : "No",  // Duplicate Attempt?
                     correctRole ? "Yes" : "No",  // Correct Role?
                     currentScore,                // Previous Points
                     earnedPoints,                // Earned Points
@@ -1512,7 +1496,7 @@ function gradeResponsesForMnemonic(mnemonic) {
         }
         
         // Update audit log formatting
-        updateAuditLogFormatting();
+        updateAuditLogFormattingWithPartialCorrect();
         
     } catch (e) {
         console.error(`❌ Error processing ${mnemonic}:`, e.message, e.stack);
@@ -1768,51 +1752,115 @@ function addTestData() {
 }
 
 /**
- * Enhanced retry operation with better backoff strategy
+ * Retry operation with exponential backoff
  */
 function retryOperation(operation, maxRetries = 3) {
     let retries = 0;
-    let lastError = null;
-    
     while (retries < maxRetries) {
         try {
             return operation();
         } catch (e) {
-            lastError = e;
-            
-            // Check if error is retryable
             if (e.toString().includes("Rate Limit") || 
                 e.toString().includes("Too many requests") ||
                 e.toString().includes("exceeded maximum execution time") ||
-                e.toString().includes("Service unavailable") ||
-                e.toString().includes("Internal error") ||
-                e.toString().includes("Timeout")) {
+                e.toString().includes("Service unavailable")) {
                 
                 if (retries < maxRetries - 1) {
-                    // Exponential backoff with jitter
-                    const baseTime = Math.pow(2, retries) * 1000;
-                    const jitter = Math.random() * 1000;
-                    const backoffTime = baseTime + jitter;
-                    
-                    console.warn(`Retry attempt ${retries + 1} after ${Math.round(backoffTime)}ms delay: ${e.message}`);
+                    const backoffTime = Math.pow(2, retries) * 1000 + Math.random() * 1000;
                     Utilities.sleep(backoffTime);
                     retries++;
+                    console.warn(`Retry attempt ${retries} after ${backoffTime}ms delay...`);
                 } else {
-                    console.error("Max retries reached:", e.message);
                     throw e;
                 }
             } else {
-                // Non-retryable error
-                console.error("Non-retryable error:", e.message);
                 throw e;
             }
         }
     }
-    
-    // If we get here, we've exhausted retries
-    throw lastError;
 }
 
+/**
+ * Flush all queued items (admin function for immediate processing)
+ */
+function flushQueue() {
+    const lock = LockService.getScriptLock();
+    try {
+        if (!lock.tryLock(10000)) {
+            console.log("Could not obtain lock for flushing queue. Another process is running.");
+            return;
+        }
+        
+        console.log("🔄 Flushing all queued submissions...");
+        
+        const sheet = SpreadsheetApp.getActiveSpreadsheet();
+        const queueSheet = sheet.getSheetByName("Processing Queue");
+        
+        if (!queueSheet) {
+            console.log("ℹ️ No queue sheet found - nothing to process");
+            return;
+        }
+        
+        const queueData = queueSheet.getDataRange().getValues();
+        if (queueData.length <= 1) {
+            console.log("ℹ️ No items in queue to process");
+            return;
+        }
+        
+        // Find all pending indices
+        const pendingIndices = [];
+        for (let i = 1; i < queueData.length; i++) {
+            if (queueData[i][2] === "No") {
+                pendingIndices.push(i);
+            }
+        }
+        
+        if (pendingIndices.length === 0) {
+            console.log("ℹ️ No pending items in queue");
+            return;
+        }
+        
+        console.log(`🔄 Flushing ${pendingIndices.length} queued submissions...`);
+        
+        // Process all pending items
+        const BATCH_SIZE = 10;
+        const startTime = new Date().getTime();
+        const MAX_EXECUTION_TIME = 250000; // 250 seconds
+        
+        let processedCount = 0;
+        
+        for (let i = 0; i < pendingIndices.length; i += BATCH_SIZE) {
+            // Check if approaching time limit
+            if (new Date().getTime() - startTime > MAX_EXECUTION_TIME) {
+                console.warn(`⏱️ Approaching time limit. Processed ${processedCount} items.`);
+                
+                // Schedule continuation
+                ScriptApp.newTrigger('flushQueue')
+                    .timeBased()
+                    .after(1000) // 1 second
+                    .create();
+                    
+                return;
+            }
+            
+            const batchIndices = pendingIndices.slice(i, i + BATCH_SIZE);
+            processBatchFromQueue(batchIndices, queueSheet, queueData);
+            processedCount += batchIndices.length;
+        }
+        
+        console.log(`✅ Successfully flushed ${processedCount} queued submissions`);
+        
+        // Update processed responses
+        updateProcessedResponses();
+    } catch (e) {
+        console.error("❌ Error in flushQueue:", e.message, e.stack);
+        logError('Flush Queue', `Error flushing queue: ${e.message}\n${e.stack}`);
+    } finally {
+        if (lock.hasLock()) {
+            lock.releaseLock();
+        }
+    }
+}
 
 /**
  * Fix timestamp formatting in Form Responses (Raw) and other sheets
@@ -1820,11 +1868,31 @@ function retryOperation(operation, maxRetries = 3) {
 function fixTimestampFormatting() {
   const sheet = SpreadsheetApp.getActiveSpreadsheet();
   const rawResponsesSheet = sheet.getSheetByName("Form Responses (Raw)");
+  const processedSheet = sheet.getSheetByName("Processed Responses");
   
   if (rawResponsesSheet && rawResponsesSheet.getLastRow() > 1) {
-    // Apply consistent date/time format
+    // Get the format from an existing cell
+    const existingFormat = rawResponsesSheet.getRange("A2").getNumberFormat();
+    
+    // Apply to all timestamp cells
     const timestampRange = rawResponsesSheet.getRange(2, 1, rawResponsesSheet.getLastRow()-1, 1);
-    timestampRange.setNumberFormat("M/d/yyyy h:mm:ss");
+    timestampRange.setNumberFormat(existingFormat);
+  }
+  
+  if (processedSheet && processedSheet.getLastRow() > 1) {
+    // Get the format from an existing cell if available, otherwise use a default format
+    let existingFormat = "M/d/yyyy h:mm:ss";
+    if (processedSheet.getLastRow() > 1) {
+      existingFormat = processedSheet.getRange("A2").getNumberFormat() || existingFormat;
+    }
+    
+    // Apply to all timestamp cells
+    const timestampRange = processedSheet.getRange(2, 1, processedSheet.getLastRow()-1, 1);
+    timestampRange.setNumberFormat(existingFormat);
+    
+    // Apply to processing timestamp column
+    const processingTimestampRange = processedSheet.getRange(2, 4, processedSheet.getLastRow()-1, 1);
+    processingTimestampRange.setNumberFormat(existingFormat);
   }
 }
 
@@ -1855,30 +1923,97 @@ function fixTextAlignment() {
   }
 }
 
+/**
+ * Creates a combined menu for all functions when the spreadsheet is opened
+ */
+/**
+ * Creates a combined menu for all functions when the spreadsheet is opened
+ */
 function onOpen() {
-    const ui = SpreadsheetApp.getUi();
-    ui.createMenu('Quiz Admin')
-        .addItem('Process Pending Responses', 'processQueue')
-        .addItem('Flush All Pending Responses', 'flushQueue')
-        .addItem('Grade Responses', 'gradeResponses')
-        .addItem('Sync Responses', 'syncResponses')
-        .addItem('Update Processed Responses', 'updateProcessedResponses')
-        .addSeparator()
-        .addItem('Delete Synced Data', 'deleteSyncData')
-        .addItem('Reset Scores', 'resetAllScores')
-        .addItem('Update Leaderboard', 'updateLeaderboard')
-        .addSeparator()
-        .addItem('Fix Formatting & Alignment', 'fixAllSheetFormatting')
-        .addItem('Clear Audit Log', 'clearAuditLog')
-        .addItem('Archive Old Audit Data', 'archiveOldData')
-        .addItem('Add Test Data (10 Entries)', 'addTestData')
-        .addItem('Clear Caches', 'clearCaches')
-        .addSeparator()
-        .addItem('Setup Automatic Processing', 'showTriggerSetupDialog') // Updated to new function
-        .addItem('Update Audit Log Formatting', 'updateAuditLogFormatting')
-        .addItem('Add Manual Points', 'showManualPointsDialog')
-        .addItem('Process Manual Form Grades', 'handleFormGradeOverride')
-        .addToUi();
+  const ui = SpreadsheetApp.getUi();
+  
+  // Create Quiz Admin menu (main menu)
+  const quizMenu = ui.createMenu('Quiz Admin')
+    // Response Processing Section
+    .addItem('Process Pending Responses', 'processQueue')
+    .addItem('Flush All Pending Responses', 'flushQueue')
+    .addItem('Grade Responses', 'gradeResponses')
+    .addItem('Sync Responses', 'syncResponses')
+    .addSeparator()
+    
+    // Grading Management
+    .addItem('Regrade Specific Mnemonic', 'promptForRegrade')
+    .addItem('Fix Q009 CDF Answers', 'fixQ009Answers')
+    .addItem('Clear Question Cache', 'clearQuestionCache')
+    .addSeparator()
+    
+    // Leaderboard & Scores Section
+    .addItem('Update Leaderboard', 'updateLeaderboard')
+    .addSeparator()
+    
+    // Tournament Management (NEW SECTION)
+    .addItem('Advance to Round 2 (Top 8)', 'advanceToRoundTwo')
+    .addItem('Update Round 2 Scores', 'updateRoundTwoScores')
+    .addItem('Advance to Round 3 (Top 4)', 'advanceToRoundThree')
+    .addItem('Update Round 3 Scores', 'updateRoundThreeScores')
+    .addItem('Advance to Round 4 (Finals)', 'advanceToRoundFour')
+    .addItem('Update Round 4 Scores', 'updateRoundFourScores')
+    .addItem('Determine Champion', 'determineChampion')
+    .addSeparator()
+    
+    // Manual Points Management
+    .addItem('Add Manual Points', 'showManualPointsDialog')
+    .addItem('Process Manual Form Grades', 'handleFormGradeOverride')
+    .addItem('Setup Manual Grade Processing Log', 'setupManualGradeProcessingLog')
+    .addItem('Recover Bonus Points', 'recoverBonusPoints')
+    .addSeparator()
+    
+    // Question Management
+    .addItem('Add New Question', 'showQuestionBankEditor')
+    .addItem('Edit Existing Question', 'editExistingQuestion')
+    .addItem('Update Daily Questions', 'updateDailyQuestions')
+    .addItem('Reset Daily Questions Trigger', 'resetDailyQuestionsTrigger')
+    .addSeparator()
+    
+    // Maintenance Section
+    .addItem('Fix Timestamp Display', 'fixTimestampDisplay')
+    .addItem('Check Timestamps', 'checkForTimestamps')
+    .addItem('Clean Duplicate Responses', 'cleanupProcessedResponses')
+    .addItem('Fix Formatting & Alignment', 'fixAllSheetFormatting')
+    .addSeparator()
+    
+    // Competition Management
+    .addItem('Determine Weekly Winners', 'testDetermineWinners')
+    .addSeparator()
+    
+    // Administrative Section
+    .addItem('Reset All Scores', 'resetAllScores')
+    .addItem('Clear Audit Log', 'clearAuditLog')
+    .addItem('Archive Old Audit Data', 'archiveOldData')
+    .addSeparator()
+    
+    // Testing & Configuration
+    .addItem('Add Test Data (10 Entries)', 'addTestData')
+    .addItem('Clear Caches', 'clearCaches')
+    .addItem('Setup Automatic Processing', 'setupTriggers');
+  
+  // Create Backup submenu
+  const backupMenu = ui.createMenu('Backup')
+    .addItem('Create Backup Now', 'createSpreadsheetBackup')
+    .addItem('List All Backups', 'listBackups')
+    .addSeparator()
+    .addItem('Set Custom Backup Folder', 'setBackupFolder')
+    .addItem('Reset to Default Backup Folder', 'resetBackupFolder')
+    .addSeparator()
+    .addItem('Schedule Daily Backups', 'createDailyBackupTrigger')
+    .addItem('Schedule Weekly Backups', 'createWeeklyBackupTrigger')
+    .addItem('Remove Backup Schedule', 'removeBackupTriggers');
+  
+  // Add the backup submenu to the Quiz Admin menu
+  quizMenu.addSubMenu(backupMenu);
+  
+  // Add the main menu to the UI
+  quizMenu.addToUi();
 }
 
 /**
@@ -1893,7 +2028,8 @@ function fixAllSheetFormatting() {
 /**
  * Get answer letters for display
  */
-function getAnswerLetters(answerText, qID, answerMapping) {
+/**
+ * function getAnswerLetters(answerText, qID, answerMapping) {
     if (!answerText || !answerMapping || !answerMapping[qID]) return answerText;
 
     if (answerText.includes(',')) {
@@ -1910,6 +2046,7 @@ function getAnswerLetters(answerText, qID, answerMapping) {
     const letterCode = answerMapping[qID][answerText.toLowerCase().trim()];
     return letterCode ? letterCode : answerText;
 }
+*/
 
 /**
  * Shorten long answer text for display
@@ -1919,23 +2056,704 @@ function shortenAnswerText(answer, maxLength = 50) {
     return answer.substring(0, maxLength) + "...";
 }
 
-/**
- * Get ungraded responses efficiently
- */
-function getUngradedResponses(responsesSheet, validMnemonics) {
-    const data = responsesSheet.getDataRange().getValues();
-    const result = [];
+function restoreTimestamps() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet();
+  const processedSheet = sheet.getSheetByName("Processed Responses");
+  const rawResponsesSheet = sheet.getSheetByName("Form Responses (Raw)");
+  
+  if (!processedSheet || !rawResponsesSheet) {
+    console.error("Required sheets not found");
+    return;
+  }
+  
+  // Get data from both sheets
+  const processedData = processedSheet.getDataRange().getValues();
+  const rawData = rawResponsesSheet.getDataRange().getValues();
+  
+  // Create a map of mnemonic to timestamps from processed responses
+  const timestampMap = new Map();
+  
+  for (let i = 1; i < processedData.length; i++) {
+    const timestamp = processedData[i][0]; // Timestamp is in column A
+    const mnemonic = processedData[i][1]?.toLowerCase()?.trim() || ""; // Mnemonic is in column B
     
-    // Create a Set for faster lookups
-    const validMnemonicsSet = new Set(validMnemonics.map(m => m.toLowerCase()));
+    if (timestamp && mnemonic) {
+      timestampMap.set(mnemonic, timestamp);
+    }
+  }
+  
+  // Track updates needed
+  let updatesNeeded = 0;
+  const updates = [];
+  
+  // Check raw responses sheet for missing timestamps
+  for (let i = 1; i < rawData.length; i++) {
+    const existingTimestamp = rawData[i][0];
+    const mnemonic = rawData[i][1]?.toLowerCase()?.trim() || "";
     
-    for (let i = 1; i < data.length; i++) {
-        const mnemonic = data[i][1]?.toString().toLowerCase();
-        if (data[i][4] !== "Yes" && mnemonic && validMnemonicsSet.has(mnemonic)) {
-            result.push([i, data[i]]);
-        }
+    // If timestamp is missing but we have mnemonic data
+    if ((!existingTimestamp || existingTimestamp === "") && mnemonic) {
+      const matchTimestamp = timestampMap.get(mnemonic);
+      
+      if (matchTimestamp) {
+        // Queue the update
+        updates.push([i+1, matchTimestamp]);
+        updatesNeeded++;
+      }
+    }
+  }
+  
+  console.log(`Found ${updatesNeeded} missing timestamps to restore`);
+  
+  if (updatesNeeded > 0) {
+    for (const [row, timestamp] of updates) {
+      rawResponsesSheet.getRange(row, 1).setValue(timestamp);
+      // Add a small delay to prevent overloading
+      Utilities.sleep(50);
     }
     
-    return result;
+    // Fix formatting
+    if (rawResponsesSheet.getLastRow() > 1) {
+      const timestampRange = rawResponsesSheet.getRange(2, 1, rawResponsesSheet.getLastRow()-1, 1);
+      timestampRange.setNumberFormat("M/d/yyyy h:mm:ss");
+    }
+    
+    console.log(`Restored ${updatesNeeded} timestamps`);
+  } else {
+    console.log("No missing timestamps found");
+  }
 }
 
+function cleanupProcessedResponses() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet();
+  const processedSheet = sheet.getSheetByName("Processed Responses");
+  
+  if (!processedSheet) {
+    console.error("Processed Responses sheet not found");
+    return;
+  }
+  
+  const data = processedSheet.getDataRange().getValues();
+  
+  if (data.length <= 1) {
+    console.log("No data to clean up");
+    return;
+  }
+  
+  // Create a set of unique entries
+  const uniqueEntries = new Map();
+  const duplicates = [];
+  
+  // Skip header row
+  for (let i = 1; i < data.length; i++) {
+    const timestamp = data[i][0];
+    const mnemonic = data[i][1];
+    
+    if (!timestamp || !mnemonic) continue;
+    
+    const key = `${mnemonic}_${timestamp}`;
+    
+    if (!uniqueEntries.has(key)) {
+      uniqueEntries.set(key, i+1); // Store row number
+    } else {
+      duplicates.push(i+1); // This is a duplicate row
+    }
+  }
+  
+  console.log(`Found ${duplicates.length} duplicate entries`);
+  
+  // Delete duplicates in reverse order to avoid index shifting
+  if (duplicates.length > 0) {
+    for (let i = duplicates.length - 1; i >= 0; i--) {
+      processedSheet.deleteRow(duplicates[i]);
+    }
+    console.log(`Removed ${duplicates.length} duplicate entries`);
+  }
+}
+
+function diagnoseTimestampIssue() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet();
+  const rawSheet = sheet.getSheetByName("Form Responses (Raw)");
+  const formSheet = sheet.getSheetByName(SHEETS.FORM_RESPONSES);
+  
+  if (!rawSheet || !formSheet) {
+    console.log("Required sheets not found");
+    return;
+  }
+  
+  // Check protection
+  const protections = rawSheet.getProtections(SpreadsheetApp.ProtectionType.RANGE);
+  for (const p of protections) {
+    const range = p.getRange();
+    if (range.getColumn() === 1) {
+      console.log("🔒 Column A is protected! Can't modify it.");
+    }
+  }
+  
+  // Check data validation
+  const validation = rawSheet.getRange("A2").getDataValidation();
+  if (validation) {
+    console.log("⚠️ Column A has data validation rules: " + validation.getCriteriaType());
+  }
+  
+  // Check for formulas
+  const formulas = rawSheet.getRange("A2:A10").getFormulas();
+  let hasFormulas = false;
+  for (const row of formulas) {
+    if (row[0]) {
+      hasFormulas = true;
+      console.log("📝 Column A contains formulas: " + row[0]);
+      break;
+    }
+  }
+  
+  // Test writing a timestamp and check if it persists
+  console.log("🧪 Testing timestamp writing...");
+  const testRow = 2; // Use the second row for testing
+  const testTimestamp = new Date();
+  rawSheet.getRange(testRow, 1).setValue(testTimestamp);
+  
+  // Get the value immediately after setting
+  const immediateValue = rawSheet.getRange(testRow, 1).getValue();
+  console.log("📊 Immediate value after setting: " + immediateValue);
+  
+  // Wait a moment and check again
+  Utilities.sleep(2000);
+  const delayedValue = rawSheet.getRange(testRow, 1).getValue();
+  console.log("📊 Value after 2 second delay: " + delayedValue);
+  
+  // Try writing with different format
+  console.log("🧪 Testing with different format...");
+  const formattedTimestamp = Utilities.formatDate(testTimestamp, Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss");
+  rawSheet.getRange(testRow, 1).setValue(formattedTimestamp);
+  
+  Utilities.sleep(2000);
+  const finalValue = rawSheet.getRange(testRow, 1).getValue();
+  console.log("📊 Final value after formatted write: " + finalValue);
+  
+  // Check display values vs actual values
+  const displayValue = rawSheet.getRange(testRow, 1).getDisplayValue();
+  console.log("📝 Display value: " + displayValue);
+  const actualValue = rawSheet.getRange(testRow, 1).getValue();
+  console.log("📝 Actual value: " + actualValue);
+  
+  // Check sheet triggers
+  const triggers = ScriptApp.getProjectTriggers();
+  console.log("⚙️ Checking for triggers that might interfere:");
+  for (const trigger of triggers) {
+    console.log(" - " + trigger.getHandlerFunction() + " (event: " + trigger.getEventType() + ")");
+  }
+  
+  // Check if column is hidden
+  const isHidden = rawSheet.isColumnHidden(1);
+  console.log("👀 Column A hidden? " + isHidden);
+  
+  // Get sample timestamps from form responses
+  const formData = formSheet.getRange("A2:A10").getValues();
+  console.log("📅 Sample timestamps from Form Responses:");
+  for (const row of formData) {
+    if (row[0]) {
+      console.log(" - " + row[0] + " (type: " + typeof row[0] + ")");
+    }
+  }
+}
+
+function fixTimestampDisplay() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet();
+  const rawSheet = sheet.getSheetByName("Form Responses (Raw)");
+  
+  if (!rawSheet) {
+    console.log("Form Responses (Raw) sheet not found");
+    return;
+  }
+  
+  // Get the last row with data
+  const lastRow = rawSheet.getLastRow();
+  if (lastRow <= 1) {
+    console.log("No data rows to fix");
+    return;
+  }
+  
+  // Try different date formats to see which one works
+  console.log("Applying different date formats to make timestamps visible...");
+  
+  // First format - standard date/time
+  rawSheet.getRange(2, 1, lastRow - 1, 1).setNumberFormat("yyyy-mm-dd hh:mm:ss");
+  
+  // Second approach - directly modify the column format
+  const sheet_id = sheet.getSheetId();
+  const column_index = 1; // Column A
+  
+  try {
+    const request = {
+      'requests': [
+        {
+          'updateDimensionProperties': {
+            'properties': {
+              'numberFormat': {
+                'type': 'DATE_TIME',
+                'pattern': 'M/d/yyyy h:mm:ss'
+              }
+            },
+            'fields': 'numberFormat',
+            'range': {
+              'sheetId': sheet_id,
+              'dimension': 'COLUMNS',
+              'startIndex': column_index - 1,
+              'endIndex': column_index
+            }
+          }
+        }
+      ]
+    };
+    
+    Sheets.Spreadsheets.batchUpdate(request, sheet.getId());
+    console.log("Applied column format via API");
+  } catch (e) {
+    console.log("API format update failed: " + e.message);
+    // Fall back to direct formatting
+    rawSheet.getRange("A:A").setNumberFormat("M/d/yyyy h:mm:ss");
+    console.log("Applied fallback formatting method");
+  }
+  
+  // Try refreshing the values by writing them back
+  const timestampValues = rawSheet.getRange(2, 1, lastRow - 1, 1).getValues();
+  rawSheet.getRange(2, 1, lastRow - 1, 1).setValues(timestampValues);
+  console.log("Refreshed timestamp values");
+}
+
+/**
+ * Prompts user for mnemonic and question ID to regrade
+ */
+function promptForRegrade() {
+  const ui = SpreadsheetApp.getUi();
+  
+  // First prompt for mnemonic
+  const mnemonicResponse = ui.prompt(
+    'Regrade Student Answer',
+    'Enter the student mnemonic to regrade:',
+    ui.ButtonSet.OK_CANCEL
+  );
+  
+  if (mnemonicResponse.getSelectedButton() !== ui.Button.OK) {
+    return;
+  }
+  
+  const mnemonic = mnemonicResponse.getResponseText().trim();
+  if (!mnemonic) {
+    ui.alert('Error', 'Mnemonic cannot be empty', ui.ButtonSet.OK);
+    return;
+  }
+  
+  // Then prompt for question ID
+  const questionResponse = ui.prompt(
+    'Question to Regrade',
+    'Enter the question ID to regrade (e.g., Q0009):',
+    ui.ButtonSet.OK_CANCEL
+  );
+  
+  if (questionResponse.getSelectedButton() !== ui.Button.OK) {
+    return;
+  }
+  
+  const questionID = questionResponse.getResponseText().trim().toUpperCase();
+  if (!questionID) {
+    ui.alert('Error', 'Question ID cannot be empty', ui.ButtonSet.OK);
+    return;
+  }
+  
+  // Show progress dialog
+  const progressMsg = ui.alert(
+    'Processing',
+    `Starting to regrade ${mnemonic} for question ${questionID}. Click OK to continue.`,
+    ui.ButtonSet.OK
+  );
+  
+  // Run the regrade operation
+  try {
+    const result = regradeSpecificAnswer(mnemonic, questionID);
+    
+    // Show result
+    if (result.success) {
+      ui.alert(
+        'Regrade Complete',
+        `Successfully regraded ${mnemonic} for question ${questionID}.\n\n${result.message}`,
+        ui.ButtonSet.OK
+      );
+    } else {
+      ui.alert(
+        'Regrade Error',
+        `Error: ${result.message}`,
+        ui.ButtonSet.OK
+      );
+    }
+  } catch (e) {
+    ui.alert(
+      'Error Occurred',
+      `An error occurred while regrading: ${e.message}`,
+      ui.ButtonSet.OK
+    );
+  }
+}
+
+
+/**
+ * Regrades a specific answer for a specific mnemonic and question
+ * Ignores duplicate check since this is a manual override
+ * @param {string} mnemonic - The student mnemonic
+ * @param {string} questionID - The question ID to regrade
+ * @returns {Object} Success status and message
+ */
+function regradeSpecificAnswer(mnemonic, questionID) {
+  // Normalize inputs
+  mnemonic = mnemonic.toLowerCase().trim();
+  questionID = questionID.toUpperCase().trim();
+  
+  console.log(`🔄 Starting regrade for ${mnemonic} question ${questionID}`);
+  
+  try {
+    const sheet = SpreadsheetApp.getActiveSpreadsheet();
+    const responsesSheet = sheet.getSheetByName("Form Responses (Raw)");
+    const questionBankSheet = sheet.getSheetByName(SHEETS.QUESTION_BANK);
+    const scoresSheet = sheet.getSheetByName(SHEETS.SCORES);
+    const auditLogSheet = sheet.getSheetByName(SHEETS.AUDIT_LOG);
+    
+    if (!responsesSheet || !questionBankSheet || !scoresSheet || !auditLogSheet) {
+      return { success: false, message: "Required sheets not found" };
+    }
+    
+    // Clear cache to ensure fresh data
+    clearQuestionCache();
+    
+    // Get question data
+    const questionBankData = questionBankSheet.getDataRange().getValues();
+    let questionData = null;
+    
+    for (let i = 1; i < questionBankData.length; i++) {
+      if (questionBankData[i][1] === questionID) {
+        questionData = {
+          question: questionBankData[i][2],
+          correctAnswer: questionBankData[i][9],
+          type: questionBankData[i][10],
+          targetRole: questionBankData[i][11],
+          points: parseInt(questionBankData[i][12]) || 0
+        };
+        break;
+      }
+    }
+    
+    if (!questionData) {
+      return { success: false, message: `Question ${questionID} not found in question bank` };
+    }
+    
+    console.log(`Question ${questionID} found with correct answer: ${questionData.correctAnswer}`);
+    
+    // Find the response for this mnemonic and question
+    const responseData = responsesSheet.getDataRange().getValues();
+    let rowIndex = -1;
+    let answerData = null;
+    let timestamp = null;
+    
+    for (let i = 1; i < responseData.length; i++) {
+      const rowMnemonic = responseData[i][1]?.toLowerCase().trim();
+      if (rowMnemonic === mnemonic) {
+        const parsedAnswer = parseAnswer(responseData[i][2]);
+        if (parsedAnswer && parsedAnswer[questionID]) {
+          rowIndex = i;
+          answerData = parsedAnswer;
+          timestamp = responseData[i][0];
+          break;
+        }
+      }
+    }
+    
+    if (rowIndex === -1 || !answerData) {
+      return { success: false, message: `No response found for ${mnemonic} and question ${questionID}` };
+    }
+    
+    const userAnswer = answerData[questionID];
+    console.log(`Found response for ${mnemonic}: ${userAnswer}`);
+    
+    // Get user role
+    const userData = getUserData(scoresSheet, mnemonic);
+    if (!userData) {
+      return { success: false, message: `User ${mnemonic} not found in scores sheet` };
+    }
+    
+    const actualRole = (userData.role || "").trim().toLowerCase();
+    const requiredRole = (questionData.targetRole || "").trim().toLowerCase();
+    
+    // Check role match
+    const correctRole = actualRole === requiredRole || !requiredRole;
+    if (!correctRole) {
+      return { 
+        success: true, 
+        message: `User ${mnemonic} has role ${actualRole} but question requires ${requiredRole}. No points awarded.` 
+      };
+    }
+    
+    // Check if already attempted (for informational purposes only)
+    const isDuplicate = hasAttemptedBefore(scoresSheet, mnemonic, questionID);
+    console.log(`User has attempted before: ${isDuplicate} (will be ignored for manual regrade)`);
+    
+    // Grade the answer
+    const isCorrect = isAnswerCorrect(userAnswer, questionData.correctAnswer, questionData.type);
+    
+    // Update raw responses with correct/incorrect status
+    const currentStatus = responsesSheet.getRange(rowIndex + 1, 6).getValue();
+    responsesSheet.getRange(rowIndex + 1, 6).setValue(isCorrect ? "Correct" : "Incorrect");
+    
+    let earnedPoints = 0;
+    let message = "";
+    
+    // Award points if answer is correct, ignoring duplicate status
+    if (correctRole && isCorrect) {
+      // Calculate points
+      if (questionData.type && questionData.type.toLowerCase() === "multiple select") {
+        earnedPoints = calculatePartialCredit(
+          userAnswer, questionData.correctAnswer, questionData.type, questionData.points
+        );
+      } else {
+        earnedPoints = questionData.points;
+      }
+      
+      // Calculate new score
+      const currentScore = getCurrentScore(scoresSheet, mnemonic);
+      
+      // If this is a duplicate attempt, we need to handle it specially to update the existing attempt
+      if (isDuplicate) {
+        // Remove previous attempt first
+        removeAttempt(scoresSheet, mnemonic, questionID);
+      }
+      
+      // Add the new attempt with points
+      updateScores(scoresSheet, mnemonic, questionID, earnedPoints, timestamp);
+      
+      // Get new score
+      const newScore = getCurrentScore(scoresSheet, mnemonic);
+      
+      message = `Answer changed from ${currentStatus} to ${isCorrect ? "Correct" : "Incorrect"}. ` +
+                `Points awarded: ${earnedPoints}. ` +
+                `Previous score: ${currentScore}, new score: ${newScore}. ` + 
+                (isDuplicate ? "(Previous attempt was overridden)" : "");
+    } else if (!isCorrect) {
+      message = `Answer is incorrect. No points awarded.`;
+    }
+    
+    // Log this regrade action in the audit log
+    auditLogSheet.appendRow([
+      new Date(),           // Timestamp
+      mnemonic,            // Mnemonic
+      questionID,          // Question ID
+      userAnswer,          // Answer
+      isCorrect ? "Correct" : "Incorrect",  // Correct?
+      "No",               // Duplicate? (marked No for manual regrading)
+      correctRole ? "Yes" : "No",  // Correct Role?
+      userData.score,      // Previous Points
+      earnedPoints,        // Earned Points
+      userData.score + earnedPoints, // Total Points
+      "Manual Regrade"     // Status
+    ]);
+    
+    // Update leaderboard
+    updateLeaderboard();
+    
+    return { success: true, message: message };
+  } catch (e) {
+    console.error(`Error regrading ${mnemonic} for ${questionID}:`, e);
+    return { success: false, message: e.message };
+  }
+}
+
+/**
+ * Helper function to get user data from scores sheet
+ */
+function getUserData(scoresSheet, mnemonic) {
+  const data = scoresSheet.getDataRange().getValues();
+  
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][0]?.toLowerCase().trim() === mnemonic.toLowerCase().trim()) {
+      return {
+        mnemonic: data[i][0],
+        name: data[i][1],
+        role: data[i][2],
+        score: Number(data[i][3]) || 0,
+        row: i + 1
+      };
+    }
+  }
+  
+  return null;
+}
+
+/**
+ * Remove a previous attempt from a user's record
+ */
+function removeAttempt(scoresSheet, mnemonic, questionID) {
+  const userData = getUserData(scoresSheet, mnemonic);
+  if (!userData) return false;
+  
+  try {
+    // Get existing attempts
+    const attemptsCell = scoresSheet.getRange(userData.row, 6);
+    const attemptsJson = attemptsCell.getValue();
+    const attempts = JSON.parse(attemptsJson || "{}");
+    
+    // Check if the question is in attempts
+    if (!(questionID in attempts)) return false;
+    
+    // Get previous points awarded for this question
+    const previousPoints = attempts[questionID].points || 0;
+    
+    // Update user's score by subtracting previous points
+    if (previousPoints > 0) {
+      const scoreCell = scoresSheet.getRange(userData.row, 4);
+      const currentScore = scoreCell.getValue();
+      scoreCell.setValue(currentScore - previousPoints);
+    }
+    
+    // Remove the question from attempts
+    delete attempts[questionID];
+    
+    // Save updated attempts
+    attemptsCell.setValue(JSON.stringify(attempts));
+    
+    return true;
+  } catch (e) {
+    console.error(`Error removing attempt for ${mnemonic} question ${questionID}:`, e);
+    return false;
+  }
+}
+
+/**
+ * Helper function to get user data from scores sheet
+ */
+function getUserData(scoresSheet, mnemonic) {
+  const data = scoresSheet.getDataRange().getValues();
+  
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][0]?.toLowerCase().trim() === mnemonic.toLowerCase().trim()) {
+      return {
+        mnemonic: data[i][0],
+        name: data[i][1],
+        role: data[i][2],
+        score: Number(data[i][3]) || 0,
+        row: i + 1
+      };
+    }
+  }
+  
+  return null;
+}
+
+/**
+ * Clears the cached question data to force a fresh load
+ * This is useful when you've updated the Question Bank but changes aren't reflecting
+ */
+function clearQuestionCache() {
+  const cache = CacheService.getScriptCache();
+  
+  // Remove all cached data related to questions
+  cache.remove('questionMap');
+  cache.remove('answerMapping');
+  cache.remove('optionsMap');
+  cache.remove('validMnemonics');
+  cache.remove('processedResponses');
+  
+  // Let the user know it's done
+  SpreadsheetApp.getUi().alert(
+    'Cache Cleared',
+    'Question cache has been cleared. The next grading operation will use fresh data from the Question Bank.',
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+  
+  console.log("🧹 Question cache cleared");
+}
+
+/**
+ * Direct fix for Q009 answers that should be correct
+ * This function directly fixes the issue without complex logic
+ */
+function fixQ009Answers() {
+  const ui = SpreadsheetApp.getUi();
+  
+  // Ask for mnemonic to fix
+  const response = ui.prompt(
+    'Fix Q009 Answer',
+    'Enter the mnemonic to fix (or leave blank to fix all CDF answers):',
+    ui.ButtonSet.OK_CANCEL
+  );
+  
+  if (response.getSelectedButton() !== ui.Button.OK) {
+    return;
+  }
+  
+  const targetMnemonic = response.getResponseText().trim().toLowerCase();
+  
+  const sheet = SpreadsheetApp.getActiveSpreadsheet();
+  const responsesSheet = sheet.getSheetByName("Form Responses (Raw)");
+  const auditLogSheet = sheet.getSheetByName(SHEETS.AUDIT_LOG);
+  const scoresSheet = sheet.getSheetByName(SHEETS.SCORES);
+  
+  if (!responsesSheet || !auditLogSheet || !scoresSheet) {
+    ui.alert("Error", "Required sheets not found", ui.ButtonSet.OK);
+    return;
+  }
+  
+  // Process the audit log
+  const auditData = auditLogSheet.getDataRange().getValues();
+  let fixedEntries = 0;
+  
+  for (let i = 1; i < auditData.length; i++) {
+    const row = auditData[i];
+    const mnemonic = row[1]?.toLowerCase();
+    const questionID = row[2];
+    const answerText = row[3];
+    
+    // Skip if not matching our target or not Q009
+    if ((targetMnemonic && mnemonic !== targetMnemonic) || questionID !== "Q009") {
+      continue;
+    }
+    
+    // If answer contains C,D,F and expected contains C,D,F, mark as correct
+    if (answerText.includes("Answer: C,D,F") && 
+        answerText.includes("Expected: C")) {
+      
+      console.log(`Fixing row ${i+1} for ${mnemonic}`);
+      
+      // Mark as correct in audit log
+      auditLogSheet.getRange(i+1, 5).setValue("Correct");
+      
+      // Award points (2 points for Q009)
+      const currentScore = getCurrentScore(scoresSheet, mnemonic);
+      updateScores(scoresSheet, mnemonic, "Q009", 2, new Date());
+      
+      // Mark as manually fixed
+      auditLogSheet.getRange(i+1, 11).setValue("Manually Fixed");
+      
+      fixedEntries++;
+    }
+  }
+  
+  // Also fix in the raw responses sheet
+  if (targetMnemonic) {
+    const rawData = responsesSheet.getDataRange().getValues();
+    
+    for (let i = 1; i < rawData.length; i++) {
+      const mnemonic = rawData[i][1]?.toLowerCase();
+      
+      if (mnemonic === targetMnemonic) {
+        const answerData = parseAnswer(rawData[i][2]);
+        
+        if (answerData && answerData["Q009"] === "C,D,F") {
+          responsesSheet.getRange(i+1, 6).setValue("Correct");
+        }
+      }
+    }
+  }
+  
+  // Update leaderboard
+  updateLeaderboard();
+  
+  ui.alert("Fix Applied", `Fixed ${fixedEntries} entries for Q009.`, ui.ButtonSet.OK);
+}

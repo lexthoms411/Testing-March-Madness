@@ -10,10 +10,10 @@ function determineWeeklyWinners() {
 
     // Define elimination dates (adjust as needed)
     var eliminationDates = [
-        new Date("2025-03-08"), // First elimination (Top 16 → Top 8)
-        new Date("2025-03-15"), // Second elimination (Top 8 → Top 4)
-        new Date("2025-03-22"), // Semi-finals (Top 4 → Top 2)
-        new Date("2025-03-29")  // Finals (Top 2 → Winner)
+        new Date("2025-03-09"), // First elimination (Top 16 → Top 8)
+        new Date("2025-03-16"), // Second elimination (Top 8 → Top 4)
+        new Date("2025-03-23"), // Semi-finals (Top 4 → Top 2)
+        new Date("2025-03-31")  // Finals (Top 2 → Winner)
     ];
 
     // Determine which round we are in

@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🏆 March Madness Points 🏆</title>
+    <style>
+      * {
+        box-sizing: border-box;
+        font-family: Arial, sans-serif;
+      }
+      body {
+        margin: 0;
+        padding: 0;
+        background-color: transparent;
+      }
+      .container {
+        max-width: 400px;
+        margin: 0 auto;
+        padding: 15px;
+        background-color: transparent; /* Changed to transparent */
+        border-radius: 12px;
+        box-shadow: none; /* Removed shadow */
+        border-top: 5px solid #FF8800;
+      }
+      h2 {
+        color: #1E407C;
+        text-align: center;
+        margin-top: 0;
+        margin-bottom: 20px;
+      }
+      .form-group {
+        margin-bottom: 15px;
+      }
+      label {
+        display: block;
+        margin-bottom: 5px;
+        font-weight: bold;
+        color: #1E407C;
+      }
+      input {
+        width: 100%;
+        padding: 10px;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        font-size: 16px;
+      }
+      button {
+        background-color: #1E407C;
+        color: white;
+        border: none;
+        padding: 12px;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 16px;
+        width: 100%;
+      }
+      button:hover {
+        background-color: #15325F;
+      }
+      .result {
+        margin-top: 20px;
+        padding: 15px;
+        background-color: rgba(255, 255, 255, 0.7); /* Semi-transparent white background */
+        border-radius: 8px;
+        box-shadow: none; /* Removed shadow */
+        text-align: center;
+        display: none;
+        border-left: 5px solid #1E407C; /* Added colored border */
+      }
+      .points-value {
+        font-size: 32px;
+        font-weight: bold;
+        color: #1E407C;
+        margin: 10px 0;
+      }
+      .error {
+        color: #ff4d4f;
+        background-color: rgba(255, 241, 240, 0.7); /* Semi-transparent error background */
+        padding: 10px;
+        border-radius: 4px;
+        margin-top: 10px;
+        text-align: center;
+        display: none;
+        border-left: 5px solid #ff4d4f; /* Added colored border */
+      }
+      .loading {
+        text-align: center;
+        margin: 10px 0;
+        display: none;
+      }
+      .spinner {
+        border: 4px solid rgba(243, 243, 243, 0.7);
+        border-top: 4px solid #1E407C;
+        border-radius: 50%;
+        width: 30px;
+        height: 30px;
+        animation: spin 1s linear infinite;
+        margin: 0 auto 10px;
+      }
+      @keyframes spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+      }
+      .user-info {
+        font-size: 14px;
+        color: #555;
+        margin-top: 5px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h2>🏆 March Madness Points 🏆</h2>
+      
+      <div class="form-group">
+        <label for="mnemonic">Your Mnemonic:</label>
+        <input type="text" id="mnemonic" placeholder="Enter your mnemonic" autocomplete="off">
+      </div>
+      
+      <button id="checkButton" onclick="checkPoints()">Current Points</button>
+      
+      <div id="loading" class="loading">
+        <div class="spinner"></div>
+        <p>Looking up your points...</p>
+      </div>
+      
+      <div id="error" class="error"></div>
+      
+      <div id="result" class="result">
+        <p>Your current points:</p>
+        <div id="points" class="points-value"></div>
+        <div id="userInfo" class="user-info"></div>
+      </div>
+    </div>
+    
+    <script>
+      // Focus the input field when the page loads
+      document.addEventListener('DOMContentLoaded', function() {
+        document.getElementById('mnemonic').focus();
+      });
+      
+      // Add event listener for Enter key
+      document.getElementById('mnemonic').addEventListener('keypress', function(e) {
+        if (e.key === 'Enter') {
+          checkPoints();
+        }
+      });
+      
+      // Function to check points
+      function checkPoints() {
+        const mnemonic = document.getElementById('mnemonic').value.trim();
+        const resultDiv = document.getElementById('result');
+        const pointsDisplay = document.getElementById('points');
+        const userInfoDiv = document.getElementById('userInfo');
+        const errorDiv = document.getElementById('error');
+        const loadingDiv = document.getElementById('loading');
+        const checkButton = document.getElementById('checkButton');
+        
+        // Validate input
+        if (!mnemonic) {
+          errorDiv.textContent = 'Please enter your mnemonic';
+          errorDiv.style.display = 'block';
+          resultDiv.style.display = 'none';
+          return;
+        }
+        
+        // Reset display
+        errorDiv.style.display = 'none';
+        resultDiv.style.display = 'none';
+        loadingDiv.style.display = 'block';
+        checkButton.disabled = true;
+        
+        // Call server function
+        google.script.run
+          .withSuccessHandler(function(result) {
+            loadingDiv.style.display = 'none';
+            checkButton.disabled = false;
+            
+            if (result.success) {
+              pointsDisplay.textContent = result.score + ' points';
+              
+              // Show user info if available
+              let userInfo = '';
+              if (result.name) userInfo += result.name;
+              if (result.role) {
+                if (userInfo) userInfo += ' • ';
+                userInfo += result.role;
+              }
+              
+              userInfoDiv.textContent = userInfo;
+              resultDiv.style.display = 'block';
+            } else {
+              errorDiv.textContent = result.message;
+              errorDiv.style.display = 'block';
+            }
+          })
+          .withFailureHandler(function(error) {
+            loadingDiv.style.display = 'none';
+            checkButton.disabled = false;
+            errorDiv.textContent = 'Error: ' + error.message;
+            errorDiv.style.display = 'block';
+          })
+          .getPointsForMnemonic(mnemonic);
+      }
+    </script>
+  </body>
+</html>

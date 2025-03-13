@@ -227,61 +227,34 @@ function moveItemToSection(form, item, section) {
   }
 }
 
+function createDailyTrigger() {
+  ScriptApp.getProjectTriggers().forEach(trigger => ScriptApp.deleteTrigger(trigger));
+  
+  ScriptApp.newTrigger('updateDailyQuestions')
+      .timeBased()
+      .atHour(0)
+      .everyDays(1)
+      .create();
+      
+  logToSheet('Trigger Setup', 'SUCCESS', 'Daily trigger created');
+}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+function resetDailyQuestionsTrigger() {
+  // Remove existing triggers for updateDailyQuestions
+  const triggers = ScriptApp.getProjectTriggers();
+  for (let i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'updateDailyQuestions') {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+  
+  // Create a new trigger
+  ScriptApp.newTrigger('updateDailyQuestions')
+      .timeBased()
+      .atHour(0)
+      .nearMinute(5) // Run at 12:05 AM to avoid midnight rush
+      .everyDays(1)
+      .create();
+      
+  console.log("Reset daily questions trigger to run at 12:05 AM");
+}
